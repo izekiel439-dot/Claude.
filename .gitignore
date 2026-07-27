@@ -1,0 +1,11 @@
+# Scan output
+ArgusScan-*.html
+ArgusScan-*.json
+*.log
+
+# Editor / OS noise
+.vs/
+.vscode/
+*.swp
+Thumbs.db
+desktop.ini
