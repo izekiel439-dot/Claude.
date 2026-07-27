@@ -1119,14 +1119,17 @@ function Start-ScanJob {
     $shell = [powershell]::Create()
     $shell.Runspace = $runspace
 
-    $null = $shell.AddScript($EngineScript.ToString())
+    $enginePayload = $EngineScript.ToString()
 
     # Single-quoted and doubled so a path containing an apostrophe cannot break
     # out of the string.
     $rootList = ($Roots | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join ','
-    $null = $shell.AddScript(
-        "Start-DriveScan -Roots @($rootList) -DeepInspection `$$DeepInspection -UseDefender `$$UseDefender"
-    )
+    # One AddScript, not two. Chaining AddScript calls composes a PIPELINE
+    # (engine | invoker), and each script block carries its own scope, so the
+    # functions the engine defines are not reliably visible to a separate
+    # second script. Keeping definitions and call in one string shares a scope.
+    $invocation = "Start-DriveScan -Roots @($rootList) -DeepInspection `$$DeepInspection -UseDefender `$$UseDefender"
+    $null = $shell.AddScript($enginePayload + [Environment]::NewLine + $invocation)
 
     return [pscustomobject]@{
         Shell    = $shell
