@@ -38,6 +38,12 @@
     Requires Windows PowerShell 5.1 (already on Windows 10/11) or PowerShell 7+.
     Windows Forms needs a single-threaded apartment; use Scan-Drive.cmd, or
     run pwsh with -STA if you launch it by hand from PowerShell 7.
+
+    The scan runs on the UI thread. The window keeps drawing because the checks
+    pump the message queue between steps, so Stop stays clickable throughout -
+    but any single long call that reports no progress will freeze it until that
+    call returns. Ticking "Also run Microsoft Defender" is the one that shows:
+    Start-MpScan can sit there for minutes with the window unresponsive.
 #>
 
 [CmdletBinding()]
@@ -55,15 +61,41 @@ $script:AppVersion     = '1.0.0'
 # ===========================================================================
 #  SCAN ENGINE
 #
-#  Defined as one scriptblock so it can be handed to a background runspace
-#  wholesale - that is what keeps the window responsive while a scan runs.
-#  It must not reference anything outside itself.
+#  Runs on the calling thread - the UI thread, in windowed mode. There is no
+#  runspace, no marshalling, and no second copy of these functions: the window
+#  calls Start-DriveScan the same way the headless path does.
+#
+#  What that costs is the thing a background thread gave for free. A scan
+#  holding the UI thread means nothing repaints unless we let it, so progress
+#  reporting and cancellation checks pump the message queue as they go (see
+#  Update-Progress below). Long single calls that report no progress - notably
+#  Start-MpScan in Invoke-DefenderScan - still block the window for their
+#  duration, because there is no point during them at which we get control back.
 # ===========================================================================
 
-$EngineScript = {
+# --- state shared with whatever is driving the scan ------------------------
+# $script:Sync carries progress, findings and the cancel flag. It is no longer
+# read from another thread, so it needs no synchronisation - but it stays the
+# single channel between the checks and the front end, which is what lets the
+# window and the headless path share one engine.
 
-# --- state shared with the UI thread ---------------------------------------
-# $Sync is injected by the caller: a synchronized hashtable the UI polls.
+# Whichever front end is driving installs a pump here: the window repaints and
+# processes clicks, headless mode writes a line. Called often enough to feel
+# live, throttled so DoEvents does not become the bottleneck.
+$script:PumpUi      = $null
+$script:PumpWatch   = [System.Diagnostics.Stopwatch]::StartNew()
+$script:PumpEveryMs = 100
+
+function Update-Progress {
+    param([switch]$Force)
+
+    if (-not $script:PumpUi) { return }
+    if (-not $Force -and $script:PumpWatch.ElapsedMilliseconds -lt $script:PumpEveryMs) { return }
+    $script:PumpWatch.Restart()
+    # Assigned away so a front end that accidentally emits something cannot
+    # leak it into the pipeline of whatever check happened to call us.
+    $null = & $script:PumpUi
+}
 
 function Add-Result {
     param(
@@ -90,7 +122,7 @@ function Add-Result {
         }
     }
 
-    $null = $Sync.Findings.Add([pscustomobject]@{
+    $null = $script:Sync.Findings.Add([pscustomobject]@{
         Severity       = $Severity
         Rank           = $rank
         Title          = $Title
@@ -112,15 +144,25 @@ function Set-Status {
     param([string]$Text, [int]$Percent = -1)
 
     $prefix = if ($script:CurrentDrive) { "$($script:CurrentDrive)  " } else { '' }
-    $Sync.Status = "$prefix$Text"
+    $script:Sync.Status = "$prefix$Text"
 
     if ($Percent -ge 0) {
         $mapped = $script:PercentBase + ($Percent * $script:PercentSpan / 100.0)
-        $Sync.Percent = [Math]::Max(0, [Math]::Min(100, [int]$mapped))
+        $script:Sync.Percent = [Math]::Max(0, [Math]::Min(100, [int]$mapped))
     }
+
+    # A status change is exactly the moment the user should see something move.
+    Update-Progress -Force
 }
 
-function Test-Cancelled { return [bool]$Sync.Cancel }
+function Test-Cancelled {
+    # Every check calls this from inside its own loop, which makes it the one
+    # place guaranteed to be reached often during long work - so it doubles as
+    # the pump. Without this the window would freeze between status updates and
+    # the Stop button would never see its click.
+    Update-Progress
+    return [bool]$script:Sync.Cancel
+}
 
 # --- helpers ---------------------------------------------------------------
 
@@ -814,19 +856,38 @@ function Invoke-DriveChecks {
 
         Set-Status 'Building a file list...' 2
 
-        $allItems = @()
+        # Walking a whole drive is the longest single step in a scan, and it is
+        # the one that used to happen safely out of sight on another thread. Run
+        # as one Get-ChildItem it would hold the UI thread for its whole
+        # duration; streaming it lets us report progress and honour Stop while
+        # the walk is still going.
+        $collected = New-Object System.Collections.ArrayList
         try {
-            $allItems = @(Get-ChildItem -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue)
+            Get-ChildItem -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                $null = $collected.Add($_)
+                if (($collected.Count % 200) -eq 0) {
+                    Set-Status "Building a file list... ($($collected.Count) items)" 2
+                    # Throwing is the reliable way to stop a pipeline early from
+                    # inside ForEach-Object; break would unwind further than we
+                    # want and leave the caught state ambiguous.
+                    if ($script:Sync.Cancel) { throw (New-Object System.OperationCanceledException 'Scan cancelled') }
+                }
+            }
         }
+        catch [System.OperationCanceledException] { }
         catch { }
+
+        $allItems = @($collected)
 
         $files       = @($allItems | Where-Object { -not $_.PSIsContainer } | Select-Object -First $MaxFiles)
         $directories = @($allItems | Where-Object { $_.PSIsContainer })
 
-        $Sync.FileCount = $files.Count
+        $script:Sync.FileCount = $files.Count
         $totalBytes = 0
         foreach ($file in $files) { $totalBytes += $file.Length }
-        $Sync.TotalSize = $totalBytes
+        $script:Sync.TotalSize = $totalBytes
+
+        if (Test-Cancelled) { return }
 
         Add-Result -Severity 'Info' -Title "Scanned $($files.Count) file(s) in $($directories.Count) folder(s)" -File $Root `
                    -Detail "Total size $([math]::Round($totalBytes / 1MB, 1)) MB. Everything below was read without being opened or run." `
@@ -873,9 +934,13 @@ function Invoke-DriveChecks {
 
 function Start-DriveScan {
     <#
-        Entry point for the runspace. Accepts one or many paths and walks them
-        in turn, so "scan everything plugged in" is a single run producing a
-        single set of results.
+        The one entry point for a scan, called directly by both front ends.
+        Accepts one or many paths and walks them in turn, so "scan everything
+        plugged in" is a single run producing a single set of results.
+
+        This returns only when the scan is finished or cancelled. Callers on the
+        UI thread stay blocked for that whole time; the window keeps drawing
+        because the checks pump it as they go, not because this returns early.
     #>
     param(
         [Parameter(Mandatory)][string[]]$Roots,
@@ -884,13 +949,11 @@ function Start-DriveScan {
         [int]$MaxFiles = 200000
     )
 
-    # Synchronized: the UI thread reads this list on a timer while this thread
-    # is still appending to it.
-    $Sync.Findings = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
-    $Sync.Percent  = 0
-    $Sync.Done     = $false
-    $Sync.Error    = $null
-    $Sync.Drives   = @($Roots)
+    $script:Sync.Findings = New-Object System.Collections.ArrayList
+    $script:Sync.Percent  = 0
+    $script:Sync.Done     = $false
+    $script:Sync.Error    = $null
+    $script:Sync.Drives   = @($Roots)
 
     try {
         $paths = @($Roots | Where-Object { $_ })
@@ -900,7 +963,7 @@ function Start-DriveScan {
         $index = 0
 
         foreach ($root in $paths) {
-            if ($Sync.Cancel) { break }
+            if ($script:Sync.Cancel) { break }
 
             $script:PercentBase  = $index * $span
             $script:PercentSpan  = $span
@@ -917,15 +980,13 @@ function Start-DriveScan {
         Set-Status $(if ($paths.Count -gt 1) { "Scan complete - $($paths.Count) drives checked." } else { 'Scan complete.' }) 100
     }
     catch {
-        $Sync.Error = $_.Exception.Message
+        $script:Sync.Error = $_.Exception.Message
         Set-Status "Scan failed: $($_.Exception.Message)" 100
     }
     finally {
-        $Sync.Done = $true
+        $script:Sync.Done = $true
     }
 }
-
-}  # end EngineScript
 
 # ===========================================================================
 #  REPORT
@@ -1090,8 +1151,11 @@ $($body.ToString())
 # ===========================================================================
 
 function New-SyncState {
-    $sync = [hashtable]::Synchronized(@{})
-    $sync.Findings  = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+    # Plain hashtable and plain list: one thread touches these now. The type
+    # still exists because it is the contract between the checks and whichever
+    # front end is showing their progress.
+    $sync = @{}
+    $sync.Findings  = New-Object System.Collections.ArrayList
     $sync.Status    = 'Ready'
     $sync.Percent   = 0
     $sync.Done      = $false
@@ -1100,49 +1164,6 @@ function New-SyncState {
     $sync.FileCount = 0
     $sync.TotalSize = 0
     return $sync
-}
-
-function Start-ScanJob {
-    param(
-        [Parameter(Mandatory)][hashtable]$Sync,
-        [Parameter(Mandatory)][string[]]$Roots,
-        [bool]$DeepInspection,
-        [bool]$UseDefender
-    )
-
-    $runspace = [runspacefactory]::CreateRunspace()
-    $runspace.ApartmentState = 'MTA'
-    $runspace.ThreadOptions  = 'ReuseThread'
-    $runspace.Open()
-    $runspace.SessionStateProxy.SetVariable('Sync', $Sync)
-
-    $shell = [powershell]::Create()
-    $shell.Runspace = $runspace
-
-    $enginePayload = $EngineScript.ToString()
-
-    # Single-quoted and doubled so a path containing an apostrophe cannot break
-    # out of the string.
-    $rootList = ($Roots | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join ','
-    # One AddScript, not two. Chaining AddScript calls composes a PIPELINE
-    # (engine | invoker), and each script block carries its own scope, so the
-    # functions the engine defines are not reliably visible to a separate
-    # second script. Keeping definitions and call in one string shares a scope.
-    $invocation = "Start-DriveScan -Roots @($rootList) -DeepInspection `$$DeepInspection -UseDefender `$$UseDefender"
-    $null = $shell.AddScript($enginePayload + [Environment]::NewLine + $invocation)
-
-    return [pscustomobject]@{
-        Shell    = $shell
-        Handle   = $shell.BeginInvoke()
-        Runspace = $runspace
-    }
-}
-
-function Stop-ScanJob {
-    param($Job)
-    if (-not $Job) { return }
-    try { $Job.Shell.Dispose() } catch { }
-    try { $Job.Runspace.Close(); $Job.Runspace.Dispose() } catch { }
 }
 
 function Get-DriveList {
@@ -1176,23 +1197,23 @@ function Get-DriveList {
 if ($NoGui) {
     if (-not $Path) { Write-Error 'Specify -Path when using -NoGui.'; exit 1 }
 
-    $sync = New-SyncState
+    $script:Sync = New-SyncState
     $startedAt = Get-Date
     Write-Host "Scanning $Path ..." -ForegroundColor Cyan
 
-    $job = Start-ScanJob -Sync $sync -Roots $Path -DeepInspection $true -UseDefender ([bool]$DefenderScan)
-
-    $lastStatus = ''
-    while (-not $sync.Done) {
-        if ($sync.Status -ne $lastStatus) {
-            $lastStatus = $sync.Status
-            Write-Host "  $lastStatus" -ForegroundColor DarkGray
+    # Nothing to poll any more - the scan runs right here. The pump just echoes
+    # each new status line as the checks reach it.
+    $script:LastConsoleStatus = ''
+    $script:PumpUi = {
+        if ($script:Sync.Status -ne $script:LastConsoleStatus) {
+            $script:LastConsoleStatus = $script:Sync.Status
+            Write-Host "  $($script:LastConsoleStatus)" -ForegroundColor DarkGray
         }
-        Start-Sleep -Milliseconds 300
     }
-    Stop-ScanJob -Job $job
 
-    $findings = @($sync.Findings)
+    Start-DriveScan -Roots @($Path) -DeepInspection $true -UseDefender ([bool]$DefenderScan)
+
+    $findings = @($script:Sync.Findings)
     $counts = @{ Critical = 0; High = 0; Medium = 0; Low = 0; Info = 0 }
     foreach ($finding in $findings) { $counts[$finding.Severity]++ }
 
@@ -1466,16 +1487,27 @@ $hintLabel.Anchor = 'Bottom, Left, Right'
 $form.Controls.Add($hintLabel)
 
 # --- state ----------------------------------------------------------------
-$script:Sync        = $null
-$script:Job         = $null
-$script:LastReport  = $null
-$script:ScanPath    = $null
-$script:ScanRoots   = @()
-$script:StartedAt   = $null
-$script:Findings    = @()
+$script:Sync         = $null
+$script:LastReport   = $null
+$script:ScanPath     = $null
+$script:ScanRoots    = @()
+$script:StartedAt    = $null
+$script:Findings     = @()
+$script:Scanning     = $false
+$script:ClosePending = $false
 
-$timer = New-Object System.Windows.Forms.Timer
-$timer.Interval = 200
+# The scan holds this thread, so the window only stays alive because this runs
+# between checks. Deliberately cheap: progress widgets and a running count, no
+# rebuilding of the results list - findings are added once, at the end.
+$script:PumpUi = {
+    if ($form.IsDisposed) { return }
+    $statusLabel.Text = "$($script:Sync.Status)"
+    $percent = [int]$script:Sync.Percent
+    if ($percent -ge 0 -and $percent -le 100) { $progressBar.Value = $percent }
+    $found = $script:Sync.Findings.Count
+    if ($found -gt 0) { $summaryLabel.Text = "$found finding(s) so far..." }
+    [System.Windows.Forms.Application]::DoEvents()
+}
 
 # --- behaviour ------------------------------------------------------------
 
@@ -1492,6 +1524,11 @@ function Set-Scanning {
 
 function Start-Scan {
     param([string[]]$Roots)
+
+    # DoEvents dispatches whatever is already queued, so a second Scan click can
+    # arrive mid-scan even though the button is disabled. Refuse it outright
+    # rather than re-entering the engine on top of itself.
+    if ($script:Scanning) { return }
 
     $Roots = @($Roots | Where-Object { $_ })
 
@@ -1533,16 +1570,26 @@ function Start-Scan {
     $script:ScanPath  = ($Roots -join ', ')
     $script:StartedAt = Get-Date
     $script:Sync      = New-SyncState
-    $script:Job       = Start-ScanJob -Sync $script:Sync -Roots $Roots -DeepInspection $deepCheck.Checked -UseDefender $defenderCheck.Checked
 
     Set-Scanning -Running $true
-    $timer.Start()
+    $script:Scanning = $true
+
+    # The scan runs here, on this thread, and this call does not come back until
+    # it is done or stopped. Everything the user sees during it happens inside
+    # $script:PumpUi.
+    try {
+        Start-DriveScan -Roots $Roots -DeepInspection $deepCheck.Checked -UseDefender $defenderCheck.Checked
+    }
+    finally {
+        $script:Scanning = $false
+        Complete-Scan
+        # A close request that arrived mid-scan was deferred until the thread
+        # came back; honour it now.
+        if ($script:ClosePending) { $form.Close() }
+    }
 }
 
 function Complete-Scan {
-    $timer.Stop()
-    Stop-ScanJob -Job $script:Job
-    $script:Job = $null
     Set-Scanning -Running $false
 
     $script:Findings = @(@($script:Sync.Findings) | Sort-Object Rank, Title)
@@ -1588,22 +1635,14 @@ function Complete-Scan {
     $saveButton.Enabled = ($script:Findings.Count -gt 0)
     $progressBar.Value = 100
 
-    if ($counts.Critical -gt 0) {
+    # Not while the window is on its way out - a modal dialog would strand the
+    # close the user already asked for.
+    if ($counts.Critical -gt 0 -and -not $script:ClosePending) {
         [void][System.Windows.Forms.MessageBox]::Show(
             "$($counts.Critical) critical finding(s) on this drive.`n`nDo not open anything on it until you have read them. Click each red row for details.",
             'Critical findings', 'OK', 'Warning')
     }
 }
-
-$timer.Add_Tick({
-    if (-not $script:Sync) { return }
-    $statusLabel.Text = "$($script:Sync.Status)"
-    $percent = [int]$script:Sync.Percent
-    if ($percent -ge 0 -and $percent -le 100) { $progressBar.Value = $percent }
-    $found = $script:Sync.Findings.Count
-    if ($found -gt 0) { $summaryLabel.Text = "$found finding(s) so far..." }
-    if ($script:Sync.Done) { Complete-Scan }
-})
 
 $scanButton.Add_Click({ Start-Scan -Roots (Get-CheckedRoots) })
 
@@ -1688,9 +1727,21 @@ $openButton.Add_Click({
 })
 
 $form.Add_FormClosing({
+    param($eventSender, $e)
+
+    if ($script:Scanning) {
+        # The scan owns this thread and is several frames below us on the stack.
+        # Disposing the form now would leave the checks writing to dead controls,
+        # so refuse the close, ask the scan to stop, and let Start-Scan close the
+        # window when it unwinds.
+        $script:Sync.Cancel  = $true
+        $script:ClosePending = $true
+        $statusLabel.Text    = 'Stopping...'
+        $e.Cancel = $true
+        return
+    }
+
     if ($script:Sync) { $script:Sync.Cancel = $true }
-    $timer.Stop()
-    Stop-ScanJob -Job $script:Job
 })
 
 Update-DriveList
