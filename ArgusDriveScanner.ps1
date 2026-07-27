@@ -97,14 +97,27 @@ function Add-Result {
         Detail         = $Detail
         Recommendation = $Recommendation
         File           = $File
+        Drive          = $script:CurrentDrive
         Evidence       = @($pairs)
     })
 }
 
+# When several drives are scanned in one run, each check still reports 0-100
+# for its own drive; these map that onto the drive's slice of the overall bar.
+$script:PercentBase = 0
+$script:PercentSpan = 100
+$script:CurrentDrive = ''
+
 function Set-Status {
     param([string]$Text, [int]$Percent = -1)
-    $Sync.Status = $Text
-    if ($Percent -ge 0) { $Sync.Percent = [Math]::Min(100, $Percent) }
+
+    $prefix = if ($script:CurrentDrive) { "$($script:CurrentDrive)  " } else { '' }
+    $Sync.Status = "$prefix$Text"
+
+    if ($Percent -ge 0) {
+        $mapped = $script:PercentBase + ($Percent * $script:PercentSpan / 100.0)
+        $Sync.Percent = [Math]::Max(0, [Math]::Min(100, [int]$mapped))
+    }
 }
 
 function Test-Cancelled { return [bool]$Sync.Cancel }
@@ -784,20 +797,17 @@ function Invoke-DefenderScan {
 
 # --- driver ----------------------------------------------------------------
 
-function Start-DriveScan {
+function Invoke-DriveChecks {
+    <#
+        Runs every check against one path. Progress is reported 0-100 for this
+        drive alone; Set-Status maps it onto the drive's slice of the bar.
+    #>
     param(
         [Parameter(Mandatory)][string]$Root,
         [bool]$DeepInspection = $true,
         [bool]$UseDefender = $false,
         [int]$MaxFiles = 200000
     )
-
-    # Synchronized: the UI thread reads this list on a timer while this thread
-    # is still appending to it.
-    $Sync.Findings = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
-    $Sync.Percent  = 0
-    $Sync.Done     = $false
-    $Sync.Error    = $null
 
     try {
         if (-not (Test-Path -LiteralPath $Root)) { throw "The path '$Root' is not available. Is the drive still plugged in?" }
@@ -849,7 +859,62 @@ function Start-DriveScan {
 
         if ($UseDefender) { Invoke-DefenderScan -Root $Root }
 
-        Set-Status 'Scan complete.' 100
+        Set-Status 'Finished this drive.' 100
+    }
+    catch {
+        # One unreadable drive must not abandon the others, so this is recorded
+        # as a finding rather than thrown.
+        Add-Result -Severity 'High' -Title "Could not scan $Root" -File $Root `
+                   -Detail "$($_.Exception.Message)" `
+                   -Recommendation 'Check the drive is still connected and that you have permission to read it, then scan again.' `
+                   -Evidence ([ordered]@{ 'Path' = $Root; 'Error' = "$($_.Exception.Message)" })
+    }
+}
+
+function Start-DriveScan {
+    <#
+        Entry point for the runspace. Accepts one or many paths and walks them
+        in turn, so "scan everything plugged in" is a single run producing a
+        single set of results.
+    #>
+    param(
+        [Parameter(Mandatory)][string[]]$Roots,
+        [bool]$DeepInspection = $true,
+        [bool]$UseDefender = $false,
+        [int]$MaxFiles = 200000
+    )
+
+    # Synchronized: the UI thread reads this list on a timer while this thread
+    # is still appending to it.
+    $Sync.Findings = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+    $Sync.Percent  = 0
+    $Sync.Done     = $false
+    $Sync.Error    = $null
+    $Sync.Drives   = @($Roots)
+
+    try {
+        $paths = @($Roots | Where-Object { $_ })
+        if ($paths.Count -eq 0) { throw 'No drives were selected.' }
+
+        $span = [Math]::Floor(100 / $paths.Count)
+        $index = 0
+
+        foreach ($root in $paths) {
+            if ($Sync.Cancel) { break }
+
+            $script:PercentBase  = $index * $span
+            $script:PercentSpan  = $span
+            $script:CurrentDrive = if ($paths.Count -gt 1) { $root } else { '' }
+
+            Invoke-DriveChecks -Root $root -DeepInspection $DeepInspection -UseDefender $UseDefender -MaxFiles $MaxFiles
+            $index++
+        }
+
+        $script:CurrentDrive = ''
+        $script:PercentBase  = 0
+        $script:PercentSpan  = 100
+
+        Set-Status $(if ($paths.Count -gt 1) { "Scan complete - $($paths.Count) drives checked." } else { 'Scan complete.' }) 100
     }
     catch {
         $Sync.Error = $_.Exception.Message
@@ -1040,7 +1105,7 @@ function New-SyncState {
 function Start-ScanJob {
     param(
         [Parameter(Mandatory)][hashtable]$Sync,
-        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string[]]$Roots,
         [bool]$DeepInspection,
         [bool]$UseDefender
     )
@@ -1055,8 +1120,12 @@ function Start-ScanJob {
     $shell.Runspace = $runspace
 
     $null = $shell.AddScript($EngineScript.ToString())
+
+    # Single-quoted and doubled so a path containing an apostrophe cannot break
+    # out of the string.
+    $rootList = ($Roots | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join ','
     $null = $shell.AddScript(
-        "Start-DriveScan -Root '$($Root -replace "'", "''")' -DeepInspection `$$DeepInspection -UseDefender `$$UseDefender"
+        "Start-DriveScan -Roots @($rootList) -DeepInspection `$$DeepInspection -UseDefender `$$UseDefender"
     )
 
     return [pscustomobject]@{
@@ -1108,7 +1177,7 @@ if ($NoGui) {
     $startedAt = Get-Date
     Write-Host "Scanning $Path ..." -ForegroundColor Cyan
 
-    $job = Start-ScanJob -Sync $sync -Root $Path -DeepInspection:([bool]$Deep -or $true) -UseDefender:([bool]$DefenderScan)
+    $job = Start-ScanJob -Sync $sync -Roots $Path -DeepInspection $true -UseDefender ([bool]$DefenderScan)
 
     $lastStatus = ''
     while (-not $sync.Done) {
@@ -1163,7 +1232,7 @@ $form.BackColor = [System.Drawing.Color]::FromArgb(246, 247, 249)
 
 # --- header ---------------------------------------------------------------
 $header = New-Object System.Windows.Forms.Label
-$header.Text = 'Select a drive and scan it'
+$header.Text = 'Tick the drives you want scanned'
 $header.Font = New-Object System.Drawing.Font('Segoe UI', 14, [System.Drawing.FontStyle]::Regular)
 $header.Location = New-Object System.Drawing.Point(18, 14)
 $header.Size = New-Object System.Drawing.Size(600, 28)
@@ -1183,7 +1252,8 @@ $driveList.Location = New-Object System.Drawing.Point(18, 70)
 $driveList.Size = New-Object System.Drawing.Size(910, 140)
 $driveList.View = 'Details'
 $driveList.FullRowSelect = $true
-$driveList.MultiSelect = $false
+$driveList.MultiSelect = $true
+$driveList.CheckBoxes = $true
 $driveList.HideSelection = $false
 $driveList.GridLines = $false
 $driveList.Anchor = 'Top, Left, Right'
@@ -1212,42 +1282,89 @@ function Update-DriveList {
         if ($drive.TypeCode -eq 2) {
             $item.ForeColor = [System.Drawing.Color]::FromArgb(23, 115, 74)
             $item.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+            # Removable drives are why you opened this, so tick them by default.
+            $item.Checked = $true
         }
         $null = $driveList.Items.Add($item)
     }
-    # Preselect the first removable drive - almost always what you want.
-    foreach ($item in $driveList.Items) {
-        if ($item.SubItems[2].Text -eq 'Removable') { $item.Selected = $true; break }
+    Update-ScanButtonText
+}
+
+function Get-CheckedRoots {
+    <#
+        Ticked rows win. If nothing is ticked, fall back to whatever row is
+        highlighted, so a single click-and-scan still works.
+    #>
+    $roots = New-Object System.Collections.ArrayList
+    foreach ($item in $driveList.CheckedItems) { $null = $roots.Add("$($item.Tag)") }
+    if ($roots.Count -eq 0) {
+        foreach ($item in $driveList.SelectedItems) { $null = $roots.Add("$($item.Tag)") }
+    }
+    return @($roots)
+}
+
+function Update-ScanButtonText {
+    $count = $driveList.CheckedItems.Count
+    if ($count -gt 1) {
+        $scanButton.Text = "SCAN $count DRIVES"
+    }
+    elseif ($count -eq 1) {
+        $scanButton.Text = "SCAN $($driveList.CheckedItems[0].Text)"
+    }
+    else {
+        $scanButton.Text = 'SCAN DRIVE'
     }
 }
 
 # --- options row ----------------------------------------------------------
+$tips = New-Object System.Windows.Forms.ToolTip
+$tips.AutoPopDelay = 12000
+
 $refreshButton = New-Object System.Windows.Forms.Button
-$refreshButton.Text = 'Refresh drives'
+$refreshButton.Text = 'Refresh'
 $refreshButton.Location = New-Object System.Drawing.Point(18, 220)
-$refreshButton.Size = New-Object System.Drawing.Size(110, 28)
+$refreshButton.Size = New-Object System.Drawing.Size(84, 28)
 $refreshButton.FlatStyle = 'System'
+$tips.SetToolTip($refreshButton, 'Re-read the drive list. Use this after plugging in a drive.')
 $form.Controls.Add($refreshButton)
+
+$tickAllButton = New-Object System.Windows.Forms.Button
+$tickAllButton.Text = 'Tick all'
+$tickAllButton.Location = New-Object System.Drawing.Point(110, 220)
+$tickAllButton.Size = New-Object System.Drawing.Size(76, 28)
+$tickAllButton.FlatStyle = 'System'
+$tips.SetToolTip($tickAllButton, 'Select every drive, including your internal hard disk. Scanning C: takes much longer.')
+$form.Controls.Add($tickAllButton)
+
+$tickNoneButton = New-Object System.Windows.Forms.Button
+$tickNoneButton.Text = 'Untick all'
+$tickNoneButton.Location = New-Object System.Drawing.Point(194, 220)
+$tickNoneButton.Size = New-Object System.Drawing.Size(84, 28)
+$tickNoneButton.FlatStyle = 'System'
+$form.Controls.Add($tickNoneButton)
 
 $browseButton = New-Object System.Windows.Forms.Button
 $browseButton.Text = 'Scan a folder...'
-$browseButton.Location = New-Object System.Drawing.Point(136, 220)
+$browseButton.Location = New-Object System.Drawing.Point(286, 220)
 $browseButton.Size = New-Object System.Drawing.Size(110, 28)
 $browseButton.FlatStyle = 'System'
+$tips.SetToolTip($browseButton, 'Scan any folder instead of a whole drive.')
 $form.Controls.Add($browseButton)
 
 $deepCheck = New-Object System.Windows.Forms.CheckBox
-$deepCheck.Text = 'Deep inspection (hashes, archives, hidden streams)'
-$deepCheck.Location = New-Object System.Drawing.Point(262, 224)
-$deepCheck.Size = New-Object System.Drawing.Size(320, 22)
+$deepCheck.Text = 'Deep inspection'
+$deepCheck.Location = New-Object System.Drawing.Point(420, 224)
+$deepCheck.Size = New-Object System.Drawing.Size(130, 22)
 $deepCheck.Checked = $true
+$tips.SetToolTip($deepCheck, 'Also compute SHA-256 hashes, look inside archives, and check for hidden data streams. Slower, but catches more.')
 $form.Controls.Add($deepCheck)
 
 $defenderCheck = New-Object System.Windows.Forms.CheckBox
-$defenderCheck.Text = 'Also run Microsoft Defender over the drive'
-$defenderCheck.Location = New-Object System.Drawing.Point(590, 224)
-$defenderCheck.Size = New-Object System.Drawing.Size(300, 22)
+$defenderCheck.Text = 'Also run Microsoft Defender'
+$defenderCheck.Location = New-Object System.Drawing.Point(560, 224)
+$defenderCheck.Size = New-Object System.Drawing.Size(200, 22)
 $defenderCheck.Checked = $true
+$tips.SetToolTip($defenderCheck, 'Run a Defender signature scan over the same drives. Catches known malware; the other checks catch disguises Defender ignores.')
 $form.Controls.Add($defenderCheck)
 
 # --- scan button + progress ----------------------------------------------
@@ -1302,9 +1419,10 @@ $resultList.MultiSelect = $false
 $resultList.HideSelection = $false
 $resultList.Anchor = 'Top, Bottom, Left, Right'
 $resultList.BackColor = [System.Drawing.Color]::White
-$null = $resultList.Columns.Add('Severity', 80)
-$null = $resultList.Columns.Add('Finding', 520)
-$null = $resultList.Columns.Add('File', 290)
+$null = $resultList.Columns.Add('Severity', 75)
+$null = $resultList.Columns.Add('Drive', 55)
+$null = $resultList.Columns.Add('Finding', 480)
+$null = $resultList.Columns.Add('File', 285)
 $form.Controls.Add($resultList)
 
 $detailBox = New-Object System.Windows.Forms.TextBox
@@ -1349,6 +1467,7 @@ $script:Sync        = $null
 $script:Job         = $null
 $script:LastReport  = $null
 $script:ScanPath    = $null
+$script:ScanRoots   = @()
 $script:StartedAt   = $null
 $script:Findings    = @()
 
@@ -1369,15 +1488,35 @@ function Set-Scanning {
 }
 
 function Start-Scan {
-    param([string]$Root)
+    param([string[]]$Roots)
 
-    if (-not $Root) {
-        [void][System.Windows.Forms.MessageBox]::Show('Select a drive from the list first, or use "Scan a folder...".', 'No drive selected', 'OK', 'Information')
+    $Roots = @($Roots | Where-Object { $_ })
+
+    if ($Roots.Count -eq 0) {
+        [void][System.Windows.Forms.MessageBox]::Show(
+            'Tick at least one drive in the list, or use "Scan a folder...".',
+            'Nothing selected', 'OK', 'Information')
         return
     }
-    if (-not (Test-Path -LiteralPath $Root)) {
-        [void][System.Windows.Forms.MessageBox]::Show("Cannot reach $Root. Is the drive still plugged in?", 'Drive not available', 'OK', 'Warning')
+
+    $missing = @($Roots | Where-Object { -not (Test-Path -LiteralPath $_) })
+    if ($missing.Count -gt 0) {
+        [void][System.Windows.Forms.MessageBox]::Show(
+            "Cannot reach: $($missing -join ', ')`n`nIs the drive still plugged in?",
+            'Drive not available', 'OK', 'Warning')
         return
+    }
+
+    # Scanning an internal disk is legitimate but slow; make sure it was meant.
+    $fixed = @()
+    foreach ($item in $driveList.CheckedItems) {
+        if ($item.SubItems[2].Text -eq 'Fixed disk' -and $Roots -contains "$($item.Tag)") { $fixed += "$($item.Tag)" }
+    }
+    if ($fixed.Count -gt 0) {
+        $answer = [System.Windows.Forms.MessageBox]::Show(
+            "You have included an internal hard disk ($($fixed -join ', ')).`n`nThat works, but it can take a long time and will produce a lot of Low and Info results. Carry on?",
+            'Internal disk selected', 'YesNo', 'Question')
+        if ($answer -ne 'Yes') { return }
     }
 
     $resultList.Items.Clear()
@@ -1387,10 +1526,11 @@ function Start-Scan {
     $saveButton.Enabled = $false
     $openButton.Enabled = $false
 
-    $script:ScanPath  = $Root
+    $script:ScanRoots = @($Roots)
+    $script:ScanPath  = ($Roots -join ', ')
     $script:StartedAt = Get-Date
     $script:Sync      = New-SyncState
-    $script:Job       = Start-ScanJob -Sync $script:Sync -Root $Root -DeepInspection $deepCheck.Checked -UseDefender $defenderCheck.Checked
+    $script:Job       = Start-ScanJob -Sync $script:Sync -Roots $Roots -DeepInspection $deepCheck.Checked -UseDefender $defenderCheck.Checked
 
     Set-Scanning -Running $true
     $timer.Start()
@@ -1408,6 +1548,9 @@ function Complete-Scan {
     $resultList.Items.Clear()
     foreach ($finding in $script:Findings) {
         $item = New-Object System.Windows.Forms.ListViewItem($finding.Severity)
+        $driveLabel = "$($finding.Drive)"
+        if (-not $driveLabel -and $script:ScanRoots.Count -eq 1) { $driveLabel = $script:ScanRoots[0] }
+        $null = $item.SubItems.Add($driveLabel)
         $null = $item.SubItems.Add($finding.Title)
         $null = $item.SubItems.Add($finding.File)
         $item.ForeColor = $colours[$finding.Severity]
@@ -1435,7 +1578,8 @@ function Complete-Scan {
         $statusLabel.Text = 'Scan stopped. Partial results shown.'
     }
     else {
-        $statusLabel.Text = "Done. $($script:Sync.FileCount) files checked in $([int]((Get-Date) - $script:StartedAt).TotalSeconds) seconds."
+        $where = if ($script:ScanRoots.Count -gt 1) { "$($script:ScanRoots.Count) drives" } else { "$($script:ScanRoots -join '')" }
+        $statusLabel.Text = "Done. $where checked in $([int]((Get-Date) - $script:StartedAt).TotalSeconds) seconds."
     }
 
     $saveButton.Enabled = ($script:Findings.Count -gt 0)
@@ -1458,11 +1602,19 @@ $timer.Add_Tick({
     if ($script:Sync.Done) { Complete-Scan }
 })
 
-$scanButton.Add_Click({
-    $root = $null
-    if ($driveList.SelectedItems.Count -gt 0) { $root = "$($driveList.SelectedItems[0].Tag)" }
-    Start-Scan -Root $root
+$scanButton.Add_Click({ Start-Scan -Roots (Get-CheckedRoots) })
+
+$tickAllButton.Add_Click({
+    foreach ($item in $driveList.Items) { $item.Checked = $true }
+    Update-ScanButtonText
 })
+
+$tickNoneButton.Add_Click({
+    foreach ($item in $driveList.Items) { $item.Checked = $false }
+    Update-ScanButtonText
+})
+
+$driveList.Add_ItemChecked({ Update-ScanButtonText })
 
 $cancelButton.Add_Click({
     if ($script:Sync) { $script:Sync.Cancel = $true }
@@ -1474,11 +1626,12 @@ $refreshButton.Add_Click({ Update-DriveList })
 $browseButton.Add_Click({
     $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
     $dialog.Description = 'Pick a folder to scan'
-    if ($dialog.ShowDialog() -eq 'OK') { Start-Scan -Root $dialog.SelectedPath }
+    if ($dialog.ShowDialog() -eq 'OK') { Start-Scan -Roots @($dialog.SelectedPath) }
 })
 
+# Double-clicking a row scans just that drive, whatever is ticked.
 $driveList.Add_DoubleClick({
-    if ($driveList.SelectedItems.Count -gt 0) { Start-Scan -Root "$($driveList.SelectedItems[0].Tag)" }
+    if ($driveList.SelectedItems.Count -gt 0) { Start-Scan -Roots @("$($driveList.SelectedItems[0].Tag)") }
 })
 
 $resultList.Add_SelectedIndexChanged({
@@ -1511,12 +1664,12 @@ $saveButton.Add_Click({
     if ($dialog.ShowDialog() -ne 'OK') { return }
 
     $driveInfo = @{}
-    if ($driveList.SelectedItems.Count -gt 0) {
-        $selected = $driveList.SelectedItems[0]
-        $driveInfo['Drive']  = "$($selected.SubItems[0].Text) $($selected.SubItems[1].Text)"
-        $driveInfo['Type']   = $selected.SubItems[2].Text
-        $driveInfo['Format'] = $selected.SubItems[3].Text
+    $described = New-Object System.Collections.ArrayList
+    foreach ($item in $driveList.Items) {
+        if ($script:ScanRoots -notcontains "$($item.Tag)") { continue }
+        $null = $described.Add("$($item.SubItems[0].Text) $($item.SubItems[1].Text) - $($item.SubItems[2].Text), $($item.SubItems[3].Text)")
     }
+    if ($described.Count -gt 0) { $driveInfo['Drives scanned'] = ($described -join ' | ') }
 
     $saved = Save-DriveReport -Findings $script:Findings -ScanPath $script:ScanPath -OutputPath $dialog.FileName `
                               -StartedAt $script:StartedAt -FinishedAt (Get-Date) -DriveInfo $driveInfo
@@ -1540,7 +1693,7 @@ $form.Add_FormClosing({
 Update-DriveList
 
 if ($Path) {
-    $form.Add_Shown({ Start-Scan -Root $Path })
+    $form.Add_Shown({ Start-Scan -Roots @($Path) })
 }
 
 [void]$form.ShowDialog()
