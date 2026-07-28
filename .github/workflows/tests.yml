@@ -35,15 +35,32 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      # actions/checkout cannot be used here. This repository's name ends in a
+      # dot, and Win32 strips trailing dots from path components, so the
+      # workspace the runner creates can never match the path checkout looks
+      # for - it fails with "Directory 'D:\a\Claude.\Claude.' does not exist"
+      # before any step of ours runs. Cloning by hand into a path we choose
+      # sidesteps the repository name entirely.
+      - name: Clone into a Windows-safe path
+        shell: pwsh
+        working-directory: C:\
+        run: |
+          git init C:\scanner
+          git -C C:\scanner remote add origin "https://github.com/${{ github.repository }}.git"
+          git -C C:\scanner fetch --depth 1 origin ${{ github.sha }}
+          git -C C:\scanner checkout FETCH_HEAD
+          Write-Host "checked out ${{ github.sha }}"
 
       - name: Engine tests (pwsh 7)
         shell: pwsh
+        working-directory: C:\scanner
         run: ./tests/Engine.Tests.ps1
 
       # The GUI half only exists here. Windows Forms needs a single-threaded
       # apartment; pwsh defaults to MTA, so -STA is not optional.
       - name: GUI tests (pwsh 7, STA)
+        shell: pwsh
+        working-directory: C:\scanner
         run: pwsh -NoProfile -STA -File ./tests/Gui.Tests.ps1
 
       # Windows PowerShell 5.1 is what the script actually ships against - it is
@@ -51,7 +68,10 @@ jobs:
       # It is STA by default.
       - name: Engine tests (Windows PowerShell 5.1)
         shell: powershell
+        working-directory: C:\scanner
         run: ./tests/Engine.Tests.ps1
 
       - name: GUI tests (Windows PowerShell 5.1, STA)
+        shell: powershell
+        working-directory: C:\scanner
         run: powershell.exe -NoProfile -STA -File ./tests/Gui.Tests.ps1
