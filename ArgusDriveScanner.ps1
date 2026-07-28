@@ -182,7 +182,10 @@ function Get-SignatureVerdict {
         Status   = $status
         Signer   = $signer
         IsValid  = ($status -eq 'Valid')
-        IsSigned = ($status -notin @('NotSigned', 'Unreadable', 'Unknown'))
+        # An exclusion list here is a trap: any status this didn't anticipate
+        # (e.g. 'UnknownError' for a file that isn't a valid PE at all) falls
+        # through as "signed" by default. List what actually means signed instead.
+        IsSigned = $status -in @('Valid', 'HashMismatch', 'NotTrusted', 'Incompatible')
     }
 }
 

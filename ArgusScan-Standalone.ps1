@@ -566,7 +566,12 @@ function Get-SignatureInfo {
     }
     catch { }
 
-    $isSigned  = ($status -ne 'NotSigned' -and $status -ne 'Unreadable' -and $status -ne 'Unknown')
+    # An exclusion list here is a trap: any SignatureStatus value the author
+    # didn't think of (e.g. 'UnknownError', returned for a file that isn't a
+    # valid PE at all - garbage bytes with an .exe extension) falls through
+    # as "signed" by default. List the statuses that mean a signature was
+    # actually present instead, so an unanticipated value defaults to unsigned.
+    $isSigned  = $status -in @('Valid', 'HashMismatch', 'NotTrusted', 'Incompatible')
     $isTrusted = ($status -eq 'Valid')
 
     # Signer subject is authoritative; company name is only a hint because it is
