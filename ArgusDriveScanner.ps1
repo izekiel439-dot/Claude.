@@ -760,9 +760,9 @@ function Test-Archives {
                        -Detail 'One or more files inside this archive are individually encrypted, so neither this scanner nor Defender can see their contents without the password. This is a standard way to smuggle malware past scanners - the password usually arrives separately, in the message that came with the file.' `
                        -Recommendation 'Do not extract or enter the password unless you know exactly who sent this and why it needed one.' `
                        -Evidence ([ordered]@{
-                           'Archive'          = $file.FullName
-                           'Encrypted entries'= (($encryptedEntries | Select-Object -First 20) -join ' | ')
-                           'Entries'          = $entryCount
+                           'Archive'           = $file.FullName
+                           'Encrypted entries' = (($encryptedEntries | Select-Object -First 20) -join ' | ')
+                           'Entries'           = $entryCount
                        })
         }
 
@@ -928,12 +928,12 @@ function Invoke-DriveChecks {
                    -Detail $scanDetail `
                    -Recommendation $(if ($truncated) { 'Consider scanning a narrower subfolder if you need full coverage of everything on this drive.' } else { '' }) `
                    -Evidence ([ordered]@{
-                       'Path'       = $Root
+                       'Path'          = $Root
                        'Files scanned' = $files.Count
                        'Files total'   = $allFiles.Count
-                       'Folders'    = $directories.Count
-                       'Size'       = "$([math]::Round($totalBytes / 1MB, 1)) MB"
-                       'Truncated'  = $truncated
+                       'Folders'       = $directories.Count
+                       'Size'          = "$([math]::Round($totalBytes / 1MB, 1)) MB"
+                       'Truncated'     = $truncated
                    })
 
         if ($files.Count -eq 0 -and $directories.Count -eq 0) {

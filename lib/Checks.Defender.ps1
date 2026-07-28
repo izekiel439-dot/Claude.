@@ -386,7 +386,7 @@ function Test-CredentialHardening {
     }
 
     $restrictAnonymous = Get-RegistryValue -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name 'RestrictAnonymous'
-    if ([int]$restrictAnonymous -eq 0) {
+    if ($null -ne $restrictAnonymous -and [int]$restrictAnonymous -eq 0) {
         Add-Finding -Category $script:DefenderCategory -Check 'CredentialHardening' -Severity 'Low' `
                     -Title 'Anonymous enumeration of accounts and shares is permitted' `
                     -Detail 'RestrictAnonymous = 0 lets an unauthenticated network peer list local accounts and shares.' `

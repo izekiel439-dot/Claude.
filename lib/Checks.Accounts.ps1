@@ -36,10 +36,10 @@ function Test-LocalAccounts {
                         -Detail 'A registry entry under Winlogon\SpecialAccounts\UserList hides this account from the logon UI and from the Users control panel while leaving it fully usable. There is essentially no legitimate reason for this on a personal machine - it is how a backdoor account is concealed.' `
                         -Recommendation "Delete the '$name' value under HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList, then disable or remove the account with Disable-LocalUser -Name '$name'." `
                         -Evidence ([ordered]@{
-                            'Account'    = $name
-                            'Enabled'    = $enabled
-                            'Last logon' = if ($user.PSObject.Properties['LastLogon']) { $user.LastLogon } else { '' }
-                            'Description'= "$($user.Description)"
+                            'Account'     = $name
+                            'Enabled'     = $enabled
+                            'Last logon'  = if ($user.PSObject.Properties['LastLogon']) { $user.LastLogon } else { '' }
+                            'Description' = "$($user.Description)"
                         })
         }
 

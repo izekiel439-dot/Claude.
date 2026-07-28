@@ -265,8 +265,8 @@ function Test-DnsConfiguration {
                         -Detail 'A Name Resolution Policy Table rule overrides normal DNS for this namespace. Common in corporate/VPN setups, unusual on a personal machine.' `
                         -Recommendation 'If this machine is not managed by an employer and you do not run a VPN that installs DNS policy, remove the rule with Remove-DnsClientNrptRule.' `
                         -Evidence ([ordered]@{
-                            'Namespace'   = ($rule.Namespace -join ', ')
-                            'Name servers'= ($rule.NameServers -join ', ')
+                            'Namespace'    = ($rule.Namespace -join ', ')
+                            'Name servers' = ($rule.NameServers -join ', ')
                         })
         }
     }
@@ -412,7 +412,7 @@ function Test-RootCertificates {
                 $severity = 'Critical'
             }
 
-            if ($certificate.NotBefore -gt (Get-Date).AddDays(-90)) {
+            if (-not $nameLikelySpoofed -and $certificate.NotBefore -gt (Get-Date).AddDays(-90)) {
                 $null = $reasons.Add("The certificate was issued recently ($($certificate.NotBefore.ToString('yyyy-MM-dd')))")
             }
             if ($certificate.NotAfter -lt (Get-Date)) {
@@ -429,13 +429,13 @@ function Test-RootCertificates {
                         -Detail (($reasons -join '; ') + '. A certificate in this store can vouch for any website on the internet, so software holding the matching private key can present a valid-looking certificate for your bank and no browser will warn you.') `
                         -Recommendation "If you cannot attribute this to software you installed (corporate VPN, antivirus with HTTPS scanning, a developer proxy), remove it: Get-ChildItem Cert:\$($storeSpec.Location)\$($storeSpec.Name)\$($certificate.Thumbprint) | Remove-Item" `
                         -Evidence ([ordered]@{
-                            'Store'      = "Cert:\$($storeSpec.Location)\$($storeSpec.Name)"
-                            'Subject'    = $subject
-                            'Issuer'     = $issuer
-                            'Thumbprint' = $certificate.Thumbprint
-                            'Valid from' = $certificate.NotBefore
-                            'Valid to'   = $certificate.NotAfter
-                            'Self-signed'= $selfSigned
+                            'Store'       = "Cert:\$($storeSpec.Location)\$($storeSpec.Name)"
+                            'Subject'     = $subject
+                            'Issuer'      = $issuer
+                            'Thumbprint'  = $certificate.Thumbprint
+                            'Valid from'  = $certificate.NotBefore
+                            'Valid to'    = $certificate.NotAfter
+                            'Self-signed' = $selfSigned
                         })
         }
     }
@@ -515,7 +515,7 @@ function Test-NameResolutionExposure {
     Write-ScanLog -Message 'LLMNR / NetBIOS name resolution' -Level 'Step'
 
     $llmnr = Get-RegistryValue -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' -Name 'EnableMulticast'
-    if ([int]$llmnr -ne 0) {
+    if ($null -eq $llmnr -or [int]$llmnr -ne 0) {
         Add-Finding -Category $script:NetworkCategory -Check 'NameResolution' -Severity 'Medium' `
                     -Title 'LLMNR multicast name resolution is enabled' `
                     -Detail 'When DNS fails, Windows shouts the hostname onto the local network and trusts whoever answers first. On a shared network an attacker answers every query and collects your NTLM credential hashes - a technique that needs no malware on your machine at all, so no antivirus can see it.' `
