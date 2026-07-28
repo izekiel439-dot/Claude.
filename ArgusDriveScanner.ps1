@@ -21,7 +21,9 @@
     directory records without being extracted.
 
 .PARAMETER Path
-    Skip the picker and scan this path immediately.
+    Skip the picker and scan this path immediately. Accepts more than one path
+    to scan them all in a single run, same as ticking multiple drives in the
+    picker.
 
 .PARAMETER NoGui
     Run headless and write a report. Useful from a scheduled task.
@@ -34,6 +36,10 @@
     .\ArgusDriveScanner.ps1 -Path E:\ -NoGui
     Scans E:\ with no window and writes a report to the Desktop.
 
+.EXAMPLE
+    .\ArgusDriveScanner.ps1 -Path E:\,F:\ -NoGui
+    Scans E:\ and F:\ in one run and writes a single combined report.
+
 .NOTES
     Requires Windows PowerShell 5.1 (already on Windows 10/11) or PowerShell 7+.
     Windows Forms needs a single-threaded apartment; use Scan-Drive.cmd, or
@@ -42,7 +48,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$Path,
+    [string[]]$Path,
     [switch]$NoGui,
     [switch]$Deep,
     [switch]$DefenderScan
@@ -1176,9 +1182,10 @@ function Get-DriveList {
 if ($NoGui) {
     if (-not $Path) { Write-Error 'Specify -Path when using -NoGui.'; exit 1 }
 
+    $scanPathDisplay = ($Path -join ', ')
     $sync = New-SyncState
     $startedAt = Get-Date
-    Write-Host "Scanning $Path ..." -ForegroundColor Cyan
+    Write-Host "Scanning $scanPathDisplay ..." -ForegroundColor Cyan
 
     $job = Start-ScanJob -Sync $sync -Roots $Path -DeepInspection $true -UseDefender ([bool]$DefenderScan)
 
@@ -1202,7 +1209,7 @@ if ($NoGui) {
     $desktop = [Environment]::GetFolderPath('Desktop')
     if (-not $desktop) { $desktop = $env:USERPROFILE }
     $reportPath = Join-Path $desktop ("DriveScan-{0}.html" -f $startedAt.ToString('yyyyMMdd-HHmmss'))
-    $null = Save-DriveReport -Findings $findings -ScanPath $Path -OutputPath $reportPath -StartedAt $startedAt -FinishedAt (Get-Date)
+    $null = Save-DriveReport -Findings $findings -ScanPath $scanPathDisplay -OutputPath $reportPath -StartedAt $startedAt -FinishedAt (Get-Date)
     Write-Host "  Report: $reportPath" -ForegroundColor Green
 
     if ($counts.Critical) { exit 3 } elseif ($counts.High) { exit 2 } elseif ($counts.Medium -or $counts.Low) { exit 1 }
