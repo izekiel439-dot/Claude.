@@ -112,6 +112,7 @@ if (-not $isWindows_) {
     exit 1
 }
 
+#region module-loader (matched by build/Build-Standalone.ps1 by these markers - keep them intact)
 $libraryPath = Join-Path $PSScriptRoot 'lib'
 foreach ($file in @('Core.ps1', 'Checks.Persistence.ps1', 'Checks.Defender.ps1', 'Checks.Network.ps1', 'Checks.Accounts.ps1', 'Report.ps1')) {
     $full = Join-Path $libraryPath $file
@@ -121,6 +122,7 @@ foreach ($file in @('Core.ps1', 'Checks.Persistence.ps1', 'Checks.Defender.ps1',
     }
     . $full
 }
+#endregion module-loader
 
 # --------------------------------------------------------------------------
 # Run

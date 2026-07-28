@@ -35,6 +35,15 @@ function Add-AutorunFinding {
     $pathFlags = @(Test-SuspiciousPath -Path $imagePath)
     $cmdFlags  = @(Test-SuspiciousCommand -CommandLine $CommandLine)
 
+    # The command line itself can look completely clean while pointing at a
+    # script file whose actual content is the malicious part - inspect that
+    # referenced file too, not just the invocation that names it.
+    $scriptContentFlags = @()
+    $referencedScript = Get-ReferencedScriptContent -CommandLine $CommandLine
+    if ($referencedScript) {
+        $scriptContentFlags = @(Test-SuspiciousCommand -CommandLine $referencedScript.Content)
+    }
+
     $reasons    = New-Object System.Collections.ArrayList
     $severities = New-Object System.Collections.ArrayList
 
@@ -44,6 +53,10 @@ function Add-AutorunFinding {
     }
     foreach ($hit in $cmdFlags) {
         $null = $reasons.Add($hit.Reason)
+        $null = $severities.Add($hit.Severity)
+    }
+    foreach ($hit in $scriptContentFlags) {
+        $null = $reasons.Add("Referenced script $(Split-Path $referencedScript.Path -Leaf): $($hit.Reason)")
         $null = $severities.Add($hit.Severity)
     }
 
@@ -63,7 +76,8 @@ function Add-AutorunFinding {
     }
 
     $leaf = if ($imagePath) { try { Split-Path $imagePath -Leaf } catch { '' } } else { '' }
-    if ($leaf -and $script:LolBinNames -contains $leaf.ToLowerInvariant()) {
+    $isLolBin = [bool]($leaf -and $script:LolBinNames -contains $leaf.ToLowerInvariant())
+    if ($isLolBin) {
         $null = $reasons.Add("Persistence runs through $leaf, a signed Windows binary commonly abused to proxy execution")
         $null = $severities.Add('Medium')
     }
@@ -73,8 +87,10 @@ function Add-AutorunFinding {
     $severity = Get-WorstSeverity -Severities @($severities) -Default $BaselineSeverity
 
     # A trusted Microsoft binary in a normal location is background noise even
-    # when it trips a soft heuristic.
-    if ($signature.IsMicrosoft -and $pathFlags.Count -eq 0 -and $cmdFlags.Count -eq 0) { $severity = 'Info' }
+    # when it trips a soft heuristic - but not when the binary itself is a
+    # known execution-proxy tool, or the script it was told to run is bad;
+    # neither of those signals may be silently dropped.
+    if ($signature.IsMicrosoft -and $pathFlags.Count -eq 0 -and $cmdFlags.Count -eq 0 -and $scriptContentFlags.Count -eq 0 -and -not $isLolBin) { $severity = 'Info' }
 
     $evidence = [ordered]@{
         'Location'    = $Source
@@ -84,6 +100,7 @@ function Add-AutorunFinding {
         'Signature'   = if ($signature.Exists) { "$($signature.Status)$(if ($signature.Signer) { " - $($signature.Signer)" })" } else { 'file not found' }
         'Publisher'   = $signature.Company
     }
+    if ($referencedScript) { $evidence['Referenced script'] = $referencedScript.Path }
     if ($ExtraEvidence) {
         foreach ($key in $ExtraEvidence.Keys) { $evidence[$key] = ConvertTo-DisplayString $ExtraEvidence[$key] }
     }
@@ -183,7 +200,7 @@ function Test-ScheduledTasks {
     try { $tasks = Get-ScheduledTask -ErrorAction Stop } catch { }
 
     if (-not $tasks) {
-        Write-ScanLog -Message 'Get-ScheduledTask unavailable; falling back to schtasks.exe' -Level 'Warn'
+        Write-ScanLog -Message 'Get-ScheduledTask unavailable; scheduled task persistence could not be checked' -Level 'Warn'
         return
     }
 
@@ -350,12 +367,14 @@ function Test-WmiSubscriptions {
 
         $linkedFilter = ''
         foreach ($binding in $bindings) {
-            if ("$($binding.Consumer)" -like "*`"$name`"*") {
-                foreach ($filter in $filters) {
-                    if ("$($binding.Filter)" -like "*`"$($filter.Name)`"*") {
-                        $linkedFilter = "$($filter.Query)"
-                    }
-                }
+            $consumerName = $null
+            if ("$($binding.Consumer)" -match '="(?<n>[^"]*)"\s*$') { $consumerName = $Matches['n'] }
+            if ($consumerName -ne $name) { continue }
+
+            foreach ($filter in $filters) {
+                $filterName = $null
+                if ("$($binding.Filter)" -match '="(?<n>[^"]*)"\s*$') { $filterName = $Matches['n'] }
+                if ($filterName -eq $filter.Name) { $linkedFilter = "$($filter.Query)" }
             }
         }
 

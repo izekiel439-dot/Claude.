@@ -625,6 +625,74 @@ function Test-MacroDocuments {
     }
 }
 
+function Get-ZipEncryptedEntryNames {
+    <#
+        Reads the general-purpose bit flag straight out of the archive's
+        central directory. Bit 0 marks an encrypted entry - this is what every
+        zip tool actually keys off. It is not safe to infer encryption from
+        whether ZipArchiveEntry.Open() throws: .NET's reader does not check
+        this flag before attempting to inflate an entry, so it can happily
+        "succeed" against encrypted bytes without raising anything.
+    #>
+    param([string]$FilePath)
+
+    $encrypted = New-Object System.Collections.Generic.List[string]
+    try {
+        $stream = [System.IO.File]::Open($FilePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try {
+            $length = $stream.Length
+            if ($length -lt 22) { return @() }
+
+            # The end-of-central-directory record sits at the end of the file,
+            # after an optional variable-length comment - search backward for it
+            # rather than assuming a fixed offset.
+            $tailSize = [Math]::Min($length, 66000)
+            $null = $stream.Seek(-$tailSize, [System.IO.SeekOrigin]::End)
+            $tail = New-Object byte[] $tailSize
+            $null = $stream.Read($tail, 0, $tailSize)
+
+            $eocdOffset = -1
+            for ($i = $tail.Length - 22; $i -ge 0; $i--) {
+                if ($tail[$i] -eq 0x50 -and $tail[$i+1] -eq 0x4B -and $tail[$i+2] -eq 0x05 -and $tail[$i+3] -eq 0x06) {
+                    $eocdOffset = $i
+                    break
+                }
+            }
+            if ($eocdOffset -lt 0) { return @() }
+
+            $cdSize   = [BitConverter]::ToUInt32($tail, $eocdOffset + 12)
+            $cdOffset = [BitConverter]::ToUInt32($tail, $eocdOffset + 16)
+            if ($cdOffset -gt [long]::MaxValue - $cdSize -or ($cdOffset + $cdSize) -gt $length) { return @() }
+
+            $null = $stream.Seek([long]$cdOffset, [System.IO.SeekOrigin]::Begin)
+            $cdBytes = New-Object byte[] $cdSize
+            $null = $stream.Read($cdBytes, 0, [int]$cdSize)
+
+            $pos = 0
+            while ($pos + 46 -le $cdBytes.Length) {
+                if (-not ($cdBytes[$pos] -eq 0x50 -and $cdBytes[$pos+1] -eq 0x4B -and $cdBytes[$pos+2] -eq 0x01 -and $cdBytes[$pos+3] -eq 0x02)) { break }
+
+                $flag       = [BitConverter]::ToUInt16($cdBytes, $pos + 8)
+                $nameLen    = [BitConverter]::ToUInt16($cdBytes, $pos + 28)
+                $extraLen   = [BitConverter]::ToUInt16($cdBytes, $pos + 30)
+                $commentLen = [BitConverter]::ToUInt16($cdBytes, $pos + 32)
+
+                if ($pos + 46 + $nameLen -gt $cdBytes.Length) { break }
+                if ($flag -band 0x0001) {
+                    $name = [System.Text.Encoding]::UTF8.GetString($cdBytes, $pos + 46, $nameLen)
+                    $encrypted.Add($name)
+                }
+
+                $pos += 46 + $nameLen + $extraLen + $commentLen
+            }
+        }
+        finally { $stream.Dispose() }
+    }
+    catch { }
+
+    return @($encrypted)
+}
+
 function Test-Archives {
     <#
         Archives are listed from their directory records, never extracted.
@@ -645,7 +713,7 @@ function Test-Archives {
         if ($file.Length -gt 500MB) { continue }
 
         $dangerous = New-Object System.Collections.ArrayList
-        $encrypted = $false
+        $archiveUnreadable = $false
         $entryCount = 0
 
         try {
@@ -656,6 +724,8 @@ function Test-Archives {
                     if ($entryCount -gt 3000) { break }
 
                     $entryName = $entry.FullName
+                    if ($entryName.EndsWith('/')) { continue }
+
                     $entryExtension = ''
                     try { $entryExtension = [IO.Path]::GetExtension($entryName).ToLowerInvariant() } catch { }
 
@@ -665,22 +735,32 @@ function Test-Archives {
                     if ($entryName -match '\.(doc|pdf|jpg|png|txt|xls)\s*\.(exe|scr|com|bat|cmd|js|vbs)$') {
                         $null = $dangerous.Add("$entryName (double extension)")
                     }
-                    # Bit 0 of the general-purpose flags marks an encrypted entry.
-                    try { if (($entry.GetType().GetProperty('.') -eq $null) -and $entry.CompressedLength -gt 0 -and $entry.Crc32 -eq 0 -and $entry.Length -gt 0) { } } catch { }
                 }
             }
             finally { $archive.Dispose() }
         }
         catch {
-            $encrypted = $true
+            $archiveUnreadable = $true
         }
 
-        if ($encrypted) {
+        if ($archiveUnreadable) {
             Add-Result -Severity 'High' -Title "Archive could not be read: $($file.Name)" -File $file.FullName `
                        -Detail 'The archive is password-protected or damaged, so neither this scanner nor Defender can see what is inside. Password-protected archives are a standard way to smuggle malware past scanners - the password sits in the email or message that came with it.' `
                        -Recommendation 'Do not extract it unless you know exactly who sent it and why it needed a password.' `
                        -Evidence ([ordered]@{ 'File' = $file.FullName; 'Size' = "$([math]::Round($file.Length / 1KB, 1)) KB" })
             continue
+        }
+
+        $encryptedEntries = @(Get-ZipEncryptedEntryNames -FilePath $file.FullName)
+        if ($encryptedEntries.Count -gt 0) {
+            Add-Result -Severity 'High' -Title "Archive contains $($encryptedEntries.Count) password-protected entr$(if ($encryptedEntries.Count -eq 1) { 'y' } else { 'ies' }): $($file.Name)" -File $file.FullName `
+                       -Detail 'One or more files inside this archive are individually encrypted, so neither this scanner nor Defender can see their contents without the password. This is a standard way to smuggle malware past scanners - the password usually arrives separately, in the message that came with the file.' `
+                       -Recommendation 'Do not extract or enter the password unless you know exactly who sent this and why it needed one.' `
+                       -Evidence ([ordered]@{
+                           'Archive'          = $file.FullName
+                           'Encrypted entries'= (($encryptedEntries | Select-Object -First 20) -join ' | ')
+                           'Entries'          = $entryCount
+                       })
         }
 
         if ($dangerous.Count -eq 0) { continue }
@@ -826,22 +906,31 @@ function Invoke-DriveChecks {
         }
         catch { }
 
-        $files       = @($allItems | Where-Object { -not $_.PSIsContainer } | Select-Object -First $MaxFiles)
+        $allFiles    = @($allItems | Where-Object { -not $_.PSIsContainer })
+        $files       = @($allFiles | Select-Object -First $MaxFiles)
         $directories = @($allItems | Where-Object { $_.PSIsContainer })
+        $truncated   = $allFiles.Count -gt $files.Count
 
         $Sync.FileCount = $files.Count
         $totalBytes = 0
         foreach ($file in $files) { $totalBytes += $file.Length }
         $Sync.TotalSize = $totalBytes
 
-        Add-Result -Severity 'Info' -Title "Scanned $($files.Count) file(s) in $($directories.Count) folder(s)" -File $Root `
-                   -Detail "Total size $([math]::Round($totalBytes / 1MB, 1)) MB. Everything below was read without being opened or run." `
-                   -Recommendation '' `
+        $scanDetail = "Total size $([math]::Round($totalBytes / 1MB, 1)) MB. Everything below was read without being opened or run."
+        if ($truncated) {
+            $scanDetail += " This drive has $($allFiles.Count) files, more than the $MaxFiles scan cap - only the first $($files.Count) were inspected. Results below are not a complete picture of this drive."
+        }
+
+        Add-Result -Severity $(if ($truncated) { 'Medium' } else { 'Info' }) -Title "Scanned $($files.Count) file(s) in $($directories.Count) folder(s)$(if ($truncated) { " (of $($allFiles.Count) total - scan cap reached)" })" -File $Root `
+                   -Detail $scanDetail `
+                   -Recommendation $(if ($truncated) { 'Consider scanning a narrower subfolder if you need full coverage of everything on this drive.' } else { '' }) `
                    -Evidence ([ordered]@{
-                       'Path'    = $Root
-                       'Files'   = $files.Count
-                       'Folders' = $directories.Count
-                       'Size'    = "$([math]::Round($totalBytes / 1MB, 1)) MB"
+                       'Path'       = $Root
+                       'Files scanned' = $files.Count
+                       'Files total'   = $allFiles.Count
+                       'Folders'    = $directories.Count
+                       'Size'       = "$([math]::Round($totalBytes / 1MB, 1)) MB"
+                       'Truncated'  = $truncated
                    })
 
         if ($files.Count -eq 0 -and $directories.Count -eq 0) {

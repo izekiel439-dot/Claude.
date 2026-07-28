@@ -25,6 +25,9 @@ function Test-ListeningPorts {
         $imagePath = if ($process) { $process.Path } else { $null }
         $signature = Get-SignatureInfo -Path $imagePath
 
+        $leaf = if ($imagePath) { try { Split-Path $imagePath -Leaf } catch { '' } } else { '' }
+        $isLolBin = [bool]($leaf -and $script:LolBinNames -contains $leaf.ToLowerInvariant())
+
         $isWildcard = ("$($listener.LocalAddress)" -eq '0.0.0.0' -or "$($listener.LocalAddress)" -eq '::')
         $isLoopback = ("$($listener.LocalAddress)" -eq '127.0.0.1' -or "$($listener.LocalAddress)" -eq '::1')
 
@@ -52,10 +55,12 @@ function Test-ListeningPorts {
             $null = $severities.Add('Medium')
         }
 
-        # A wildcard bind on a high port by a non-Microsoft binary is the
-        # classic shape of a backdoor or an unintentionally exposed service.
-        if ($isWildcard -and -not $signature.IsMicrosoft -and $expectedSystemPorts -notcontains [int]$listener.LocalPort) {
-            $null = $reasons.Add("Accepts connections from any network interface on port $($listener.LocalPort)")
+        # A wildcard bind on a high port is the classic shape of a backdoor or
+        # an unintentionally exposed service. Signed Microsoft binaries are
+        # normally excluded as noise, but known execution-proxy LOLBins are
+        # Microsoft-signed by definition and must not get a free pass here.
+        if ($isWildcard -and (-not $signature.IsMicrosoft -or $isLolBin) -and $expectedSystemPorts -notcontains [int]$listener.LocalPort) {
+            $null = $reasons.Add("Accepts connections from any network interface on port $($listener.LocalPort)$(if ($isLolBin) { " - held by $leaf, a signed Windows utility commonly abused to proxy network activity" })")
             $null = $severities.Add('Medium')
         }
 
@@ -99,11 +104,20 @@ function Test-OutboundConnections {
         if (-not $imagePath) { continue }
 
         $signature = Get-SignatureInfo -Path $imagePath
-        if ($signature.IsMicrosoft) { continue }
+        $leaf = try { Split-Path $imagePath -Leaf } catch { '' }
+        $isLolBin = [bool]($leaf -and $script:LolBinNames -contains $leaf.ToLowerInvariant())
+
+        # Microsoft-signed binaries are normally excluded as noise, but the
+        # LOLBin list is Microsoft-signed by definition - a C2 channel proxied
+        # through mshta/rundll32/certutil/etc. must not be waved through here.
+        if ($signature.IsMicrosoft -and -not $isLolBin) { continue }
 
         $reasons = @(Test-SuspiciousPath -Path $imagePath)
-        if (-not $signature.IsSigned)       { $reasons += 'The connecting process is unsigned' }
-        elseif (-not $signature.IsTrusted)  { $reasons += "The connecting process has an invalid signature ($($signature.Status))" }
+        if (-not $signature.IsMicrosoft) {
+            if (-not $signature.IsSigned)       { $reasons += 'The connecting process is unsigned' }
+            elseif (-not $signature.IsTrusted)  { $reasons += "The connecting process has an invalid signature ($($signature.Status))" }
+        }
+        if ($isLolBin) { $reasons += "The connection is held by $leaf, a signed Windows utility frequently abused as a network proxy for malware (living-off-the-land)" }
         if ($reasons.Count -eq 0) { continue }
 
         # One finding per binary, not per socket.
@@ -116,9 +130,12 @@ function Test-OutboundConnections {
                    ForEach-Object { "$($_.RemoteAddress):$($_.RemotePort)" } |
                    Select-Object -Unique -First 12)
 
-        Add-Finding -Category $script:NetworkCategory -Check 'OutboundConnections' -Severity 'High' `
-                    -Title "Unsigned process '$($process.Name)' has active internet connections" `
-                    -Detail (($reasons -join '; ') + '. An unsigned binary holding open outbound sessions is the normal shape of command-and-control or data exfiltration traffic.') `
+        $severity = if ($signature.IsMicrosoft) { 'Medium' } else { 'High' }
+        $titlePrefix = if ($signature.IsMicrosoft) { 'Signed LOLBin' } else { 'Unsigned process' }
+
+        Add-Finding -Category $script:NetworkCategory -Check 'OutboundConnections' -Severity $severity `
+                    -Title "$titlePrefix '$($process.Name)' has active internet connections" `
+                    -Detail (($reasons -join '; ') + '. ' + $(if ($signature.IsMicrosoft) { 'A genuine Windows utility holding open outbound sessions can be entirely legitimate network activity, or it can be malware proxying its traffic through a trusted binary to avoid exactly this kind of check.' } else { 'An unsigned binary holding open outbound sessions is the normal shape of command-and-control or data exfiltration traffic.' })) `
                     -Recommendation 'Identify the program. If you cannot attribute it to software you installed, kill the process, block it in the firewall, and submit the file to VirusTotal before deleting.' `
                     -Evidence ([ordered]@{
                         'Process'    = "$($process.Name) (PID $($process.Id))"
@@ -361,17 +378,33 @@ function Test-RootCertificates {
             $subject = "$($certificate.Subject)"
             $issuer  = "$($certificate.Issuer)"
 
+            $selfSigned = ($subject -eq $issuer)
+
+            # The Subject field is free text the certificate's own author
+            # chose, so a rogue self-signed root can simply name itself
+            # "Microsoft Corporation" or "DigiCert Trusted Root" and defeat a
+            # bare substring match. A name match only counts as a real pass
+            # when the certificate isn't a freshly-minted self-signed one -
+            # genuine bundled Windows/major-CA roots are long established,
+            # not something appearing with a recent issue date.
             $recognised = $false
             foreach ($known in $expectedIssuers) {
                 if ($subject -like "*$known*") { $recognised = $true; break }
             }
-            if ($recognised) { continue }
+            $recentlyIssued = ($certificate.NotBefore -gt (Get-Date).AddYears(-2))
+            $nameLikelySpoofed = ($recognised -and $selfSigned -and $recentlyIssued)
+            if ($recognised -and -not $nameLikelySpoofed) { continue }
 
-            $reasons    = New-Object System.Collections.ArrayList
-            $severity   = $storeSpec.BaseSeverity
-            $selfSigned = ($subject -eq $issuer)
+            $reasons  = New-Object System.Collections.ArrayList
+            $severity = $storeSpec.BaseSeverity
 
-            if ($selfSigned) { $null = $reasons.Add('The certificate is self-signed, so nobody vouched for it but itself') }
+            if ($nameLikelySpoofed) {
+                $severity = 'Critical'
+                $null = $reasons.Add("The subject name matches a known CA ('$(Get-CommonName $subject)'), but this certificate is self-signed and was issued recently - genuine Windows/major-CA roots are long-established and are never distributed this way, so a trusted-sounding name here is a red flag rather than a pass")
+            }
+            elseif ($selfSigned) {
+                $null = $reasons.Add('The certificate is self-signed, so nobody vouched for it but itself')
+            }
 
             # Interception proxies name themselves; this catches the honest ones.
             if ($subject -match 'Fiddler|Charles|Burp|mitmproxy|BrowserStack|Zscaler|Netskope|Forcepoint|Blue ?Coat|Cisco Umbrella|Kaspersky Anti-Virus Personal Root|AVG|Avast|ESET SSL Filter|BitDefender Personal|DO_NOT_TRUST') {

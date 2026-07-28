@@ -155,6 +155,7 @@ Adding a check means writing a `Test-Something` function that calls `Add-Finding
 ## Limits worth knowing
 
 - **This is not an antivirus.** It has no signatures and does not detect malware by content. Keep Defender enabled alongside it.
+- **Command-line and script-content pattern matching can be defeated deliberately.** Checks for things like `FromBase64String` or `IEX` are literal text/regex matches against a command line or a referenced script's content. PowerShell's own syntax defeats this trivially — backtick-escaping between any two characters (`I`E`X`), string concatenation, or the `-f` format operator all still execute the same code without containing the literal substring being matched. Reliably catching this needs AST-level analysis of the actual parsed script, not text patterns. Treat a clean result from these specific checks as "nothing obvious," not "definitely clean."
 - **Heuristics produce false positives.** Unsigned binaries in unusual folders are common in legitimate indie and open-source software.
 - **A rootkit can lie to it.** Argus asks Windows questions through normal APIs. Kernel-level malware can answer falsely. If you have real reason to suspect compromise, scan the disk offline from separate boot media.
 - **Not elevated means not complete.** The report states this at the top when it applies.

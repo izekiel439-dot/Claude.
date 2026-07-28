@@ -317,7 +317,7 @@ $style
 
 <div class="verdict $verdictClass">
   $verdict
-  <span>$(ConvertTo-HtmlText (Get-SeverityGuidance ($(if ($counts.Critical) { 'Critical' } elseif ($counts.High) { 'High' } elseif ($counts.Medium) { 'Medium' } else { 'Info' }))))</span>
+  <span>$(ConvertTo-HtmlText (Get-SeverityGuidance ($(if ($counts.Critical) { 'Critical' } elseif ($counts.High) { 'High' } elseif ($counts.Medium) { 'Medium' } elseif ($counts.Low) { 'Low' } else { 'Info' }))))</span>
 </div>
 
 $tiles

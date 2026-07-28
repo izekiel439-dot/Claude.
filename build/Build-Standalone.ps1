@@ -36,10 +36,12 @@ $modules = @(
 
 $source = Get-Content -LiteralPath $entry -Raw
 
-# The loader block runs from $PSScriptRoot\lib; the bundle has no lib folder.
-$loaderPattern = '(?ms)^\$libraryPath = Join-Path \$PSScriptRoot ''lib''.*?^\}\r?\n'
+# Matched by explicit region markers rather than the shape of the code, so
+# reformatting the loader block in Invoke-PCScan.ps1 can't silently break the
+# build - only removing the markers themselves can.
+$loaderPattern = '(?ms)^#region module-loader.*?^#endregion module-loader\r?\n'
 if ($source -notmatch $loaderPattern) {
-    throw "Could not locate the module loader block in $entry. Update the pattern in this build script."
+    throw "Could not locate the '#region module-loader' / '#endregion module-loader' markers in $entry. They must wrap the lib-loading block for this build script to work."
 }
 
 $bundle = New-Object System.Text.StringBuilder

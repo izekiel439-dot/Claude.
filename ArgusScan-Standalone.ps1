@@ -1,4 +1,4 @@
-# ---------------------------------------------------------------------------
+﻿# ---------------------------------------------------------------------------
 # GENERATED FILE - built from Invoke-PCScan.ps1 + lib/ by build/Build-Standalone.ps1
 # Edit the sources in the repository, not this file, then rebuild.
 # ---------------------------------------------------------------------------
@@ -431,6 +431,35 @@ function Expand-PathVariables {
     return $expanded.Trim()
 }
 
+function Get-ReferencedScriptContent {
+    <#
+        .SYNOPSIS
+        Reads the content of a script file a command line points at.
+
+        A Run key or Scheduled Task entry that reads
+        "powershell.exe -File C:\ProgramData\Vendor\task.ps1" looks completely
+        clean by command-line pattern matching alone - the badness, if any, is
+        inside task.ps1, which nothing was reading before. This is capped at
+        400 lines so one huge referenced file can't stall a scan.
+    #>
+    param([string]$CommandLine)
+
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) { return $null }
+
+    foreach ($match in [regex]::Matches($CommandLine, '(?i)(?<path>"[^"]+\.(ps1|vbs|js|jse|bat|cmd|wsf|hta)"|\S+\.(ps1|vbs|js|jse|bat|cmd|wsf|hta)\b)')) {
+        $candidate = $match.Groups['path'].Value.Trim('"')
+        $expanded  = Expand-PathVariables -Path $candidate
+        if (-not (Test-Path -LiteralPath $expanded -PathType Leaf -ErrorAction SilentlyContinue)) { continue }
+
+        try {
+            $content = (Get-Content -LiteralPath $expanded -TotalCount 400 -ErrorAction Stop) -join "`n"
+            if ($content) { return [pscustomobject]@{ Path = $expanded; Content = $content } }
+        }
+        catch { }
+    }
+    return $null
+}
+
 function Resolve-ExecutablePath {
     <#
         .SYNOPSIS
@@ -586,14 +615,14 @@ function Test-SuspiciousPath {
     if ($leaf -match "[\u202A-\u202E\u2066-\u2069]") {
         $null = $reasons.Add('Filename contains a bidirectional text override character')
     }
-    if ($leaf -match '\.(doc|docx|pdf|jpg|png|txt|xls|xlsx|mp4|zip)\s*\.(exe|scr|com|pif|bat|cmd|js|vbs)$') {
+    if ($leaf -match '\.(doc|docx|pdf|jpg|png|txt|xls|xlsx|mp4|zip)\s*\.(exe|scr|com|pif|bat|cmd|js|jse|vbs|vbe|wsf|hta|msi|scf|url|lnk)$') {
         $null = $reasons.Add('Filename uses a double extension')
     }
     if ($leaf -match '\s+\.(exe|scr|com|dll)$') {
         $null = $reasons.Add('Filename pads the extension with whitespace')
     }
     # System binary names living outside the system directory.
-    if ($leaf -match '^(svchost|lsass|csrss|services|winlogon|explorer|smss|spoolsv|taskhost|dwm|conhost)\.exe$' -and
+    if ($leaf -match '^(svchost|lsass|csrss|services|winlogon|explorer|smss|spoolsv|taskhost|taskhostw|dwm|conhost|wininit|lsm|sihost|ctfmon|dllhost|runtimebroker|searchindexer|fontdrvhost)\.exe$' -and
         $Path -notmatch '\\Windows\\(System32|SysWOW64|WinSxS)\\') {
         $null = $reasons.Add('Masquerades as a Windows system binary but sits outside System32')
     }
@@ -749,6 +778,15 @@ function Add-AutorunFinding {
     $pathFlags = @(Test-SuspiciousPath -Path $imagePath)
     $cmdFlags  = @(Test-SuspiciousCommand -CommandLine $CommandLine)
 
+    # The command line itself can look completely clean while pointing at a
+    # script file whose actual content is the malicious part - inspect that
+    # referenced file too, not just the invocation that names it.
+    $scriptContentFlags = @()
+    $referencedScript = Get-ReferencedScriptContent -CommandLine $CommandLine
+    if ($referencedScript) {
+        $scriptContentFlags = @(Test-SuspiciousCommand -CommandLine $referencedScript.Content)
+    }
+
     $reasons    = New-Object System.Collections.ArrayList
     $severities = New-Object System.Collections.ArrayList
 
@@ -758,6 +796,10 @@ function Add-AutorunFinding {
     }
     foreach ($hit in $cmdFlags) {
         $null = $reasons.Add($hit.Reason)
+        $null = $severities.Add($hit.Severity)
+    }
+    foreach ($hit in $scriptContentFlags) {
+        $null = $reasons.Add("Referenced script $(Split-Path $referencedScript.Path -Leaf): $($hit.Reason)")
         $null = $severities.Add($hit.Severity)
     }
 
@@ -777,7 +819,8 @@ function Add-AutorunFinding {
     }
 
     $leaf = if ($imagePath) { try { Split-Path $imagePath -Leaf } catch { '' } } else { '' }
-    if ($leaf -and $script:LolBinNames -contains $leaf.ToLowerInvariant()) {
+    $isLolBin = [bool]($leaf -and $script:LolBinNames -contains $leaf.ToLowerInvariant())
+    if ($isLolBin) {
         $null = $reasons.Add("Persistence runs through $leaf, a signed Windows binary commonly abused to proxy execution")
         $null = $severities.Add('Medium')
     }
@@ -787,8 +830,10 @@ function Add-AutorunFinding {
     $severity = Get-WorstSeverity -Severities @($severities) -Default $BaselineSeverity
 
     # A trusted Microsoft binary in a normal location is background noise even
-    # when it trips a soft heuristic.
-    if ($signature.IsMicrosoft -and $pathFlags.Count -eq 0 -and $cmdFlags.Count -eq 0) { $severity = 'Info' }
+    # when it trips a soft heuristic - but not when the binary itself is a
+    # known execution-proxy tool, or the script it was told to run is bad;
+    # neither of those signals may be silently dropped.
+    if ($signature.IsMicrosoft -and $pathFlags.Count -eq 0 -and $cmdFlags.Count -eq 0 -and $scriptContentFlags.Count -eq 0 -and -not $isLolBin) { $severity = 'Info' }
 
     $evidence = [ordered]@{
         'Location'    = $Source
@@ -798,6 +843,7 @@ function Add-AutorunFinding {
         'Signature'   = if ($signature.Exists) { "$($signature.Status)$(if ($signature.Signer) { " - $($signature.Signer)" })" } else { 'file not found' }
         'Publisher'   = $signature.Company
     }
+    if ($referencedScript) { $evidence['Referenced script'] = $referencedScript.Path }
     if ($ExtraEvidence) {
         foreach ($key in $ExtraEvidence.Keys) { $evidence[$key] = ConvertTo-DisplayString $ExtraEvidence[$key] }
     }
@@ -897,7 +943,7 @@ function Test-ScheduledTasks {
     try { $tasks = Get-ScheduledTask -ErrorAction Stop } catch { }
 
     if (-not $tasks) {
-        Write-ScanLog -Message 'Get-ScheduledTask unavailable; falling back to schtasks.exe' -Level 'Warn'
+        Write-ScanLog -Message 'Get-ScheduledTask unavailable; scheduled task persistence could not be checked' -Level 'Warn'
         return
     }
 
@@ -1064,12 +1110,14 @@ function Test-WmiSubscriptions {
 
         $linkedFilter = ''
         foreach ($binding in $bindings) {
-            if ("$($binding.Consumer)" -like "*`"$name`"*") {
-                foreach ($filter in $filters) {
-                    if ("$($binding.Filter)" -like "*`"$($filter.Name)`"*") {
-                        $linkedFilter = "$($filter.Query)"
-                    }
-                }
+            $consumerName = $null
+            if ("$($binding.Consumer)" -match '="(?<n>[^"]*)"\s*$') { $consumerName = $Matches['n'] }
+            if ($consumerName -ne $name) { continue }
+
+            foreach ($filter in $filters) {
+                $filterName = $null
+                if ("$($binding.Filter)" -match '="(?<n>[^"]*)"\s*$') { $filterName = $Matches['n'] }
+                if ($filterName -eq $filter.Name) { $linkedFilter = "$($filter.Query)" }
             }
         }
 
@@ -1894,21 +1942,21 @@ function Test-SystemHardening {
     $secureDesk   = Get-RegistryValue -Path $systemPolicy -Name 'PromptOnSecureDesktop'
     $tokenFilter  = Get-RegistryValue -Path $systemPolicy -Name 'LocalAccountTokenFilterPolicy'
 
-    if ([int]$enableLua -eq 0) {
+    if ($null -ne $enableLua -and [int]$enableLua -eq 0) {
         Add-Finding -Category $script:DefenderCategory -Check 'Hardening' -Severity 'Critical' `
                     -Title 'User Account Control is completely disabled' `
                     -Detail 'EnableLUA = 0 means every process started by an administrator runs fully elevated with no prompt. It also disables the sandboxing that protects Edge and other applications.' `
                     -Recommendation 'Set EnableLUA to 1 and reboot.' `
                     -Evidence ([ordered]@{ 'EnableLUA' = $enableLua })
     }
-    elseif ([int]$consent -eq 0) {
+    elseif ($null -ne $consent -and [int]$consent -eq 0) {
         Add-Finding -Category $script:DefenderCategory -Check 'Hardening' -Severity 'High' `
                     -Title 'UAC elevates administrators without prompting' `
                     -Detail 'ConsentPromptBehaviorAdmin = 0 ("Elevate without prompting") lets any process silently gain full administrator rights.' `
                     -Recommendation 'Set ConsentPromptBehaviorAdmin to 2 (always prompt on the secure desktop).' `
                     -Evidence ([ordered]@{ 'ConsentPromptBehaviorAdmin' = $consent })
     }
-    elseif ([int]$consent -eq 5 -and [int]$secureDesk -eq 0) {
+    elseif ($null -ne $consent -and [int]$consent -eq 5 -and $null -ne $secureDesk -and [int]$secureDesk -eq 0) {
         Add-Finding -Category $script:DefenderCategory -Check 'Hardening' -Severity 'Medium' `
                     -Title 'UAC prompts are not shown on the secure desktop' `
                     -Detail 'With PromptOnSecureDesktop = 0 the consent dialog can be manipulated by other software running in your session.' `
@@ -2063,29 +2111,48 @@ function Test-SystemHardening {
 function Test-PatchLevel {
     Write-ScanLog -Message 'Patch level' -Level 'Step'
 
-    try {
-        $latest = Get-HotFix -ErrorAction Stop |
-                  Where-Object { $_.InstalledOn } |
-                  Sort-Object InstalledOn -Descending |
-                  Select-Object -First 1
+    # Get-HotFix only reflects the classic QFE mechanism and routinely misses
+    # the cumulative updates that carry most of the actual security fixes on
+    # Windows 10/11, which can make a fully patched machine look stale. Cross
+    # -check against Windows Update's own last-success timestamp and trust
+    # whichever source is more recent.
+    $candidates = New-Object System.Collections.ArrayList
 
-        if ($latest) {
-            $age = ((Get-Date) - $latest.InstalledOn).TotalDays
-            if ($age -gt 60) {
-                $severity = if ($age -gt 120) { 'High' } else { 'Medium' }
-                Add-Finding -Category $script:DefenderCategory -Check 'PatchLevel' -Severity $severity `
-                            -Title "No Windows update installed in $([int]$age) days" `
-                            -Detail 'Unpatched machines are exploited through vulnerabilities that no antivirus product will catch, because the exploit runs inside a trusted process.' `
-                            -Recommendation 'Run Windows Update. If updates are failing or the service is disabled, resolve that first - blocked updates are a common post-compromise action.' `
-                            -Evidence ([ordered]@{
-                                'Most recent hotfix' = $latest.HotFixID
-                                'Installed on'       = $latest.InstalledOn
-                                'Days ago'           = [int]$age
-                            })
-            }
+    try {
+        $latestHotfix = Get-HotFix -ErrorAction Stop |
+                        Where-Object { $_.InstalledOn } |
+                        Sort-Object InstalledOn -Descending |
+                        Select-Object -First 1
+        if ($latestHotfix) {
+            $null = $candidates.Add([pscustomobject]@{ Date = $latestHotfix.InstalledOn; Source = "Hotfix $($latestHotfix.HotFixID)" })
         }
     }
     catch { }
+
+    $lastSuccess = Get-RegistryValue -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\Results\Install' -Name 'LastSuccessTime'
+    if ($lastSuccess) {
+        $parsed = [datetime]::MinValue
+        if ([datetime]::TryParse("$lastSuccess", [ref]$parsed)) {
+            $null = $candidates.Add([pscustomobject]@{ Date = $parsed; Source = 'Windows Update history' })
+        }
+    }
+
+    if ($candidates.Count -gt 0) {
+        $latest = $candidates | Sort-Object Date -Descending | Select-Object -First 1
+        $age = ((Get-Date) - $latest.Date).TotalDays
+        if ($age -gt 60) {
+            $severity = if ($age -gt 120) { 'High' } else { 'Medium' }
+            Add-Finding -Category $script:DefenderCategory -Check 'PatchLevel' -Severity $severity `
+                        -Title "No Windows update installed in $([int]$age) days" `
+                        -Detail 'Unpatched machines are exploited through vulnerabilities that no antivirus product will catch, because the exploit runs inside a trusted process.' `
+                        -Recommendation 'Run Windows Update. If updates are failing or the service is disabled, resolve that first - blocked updates are a common post-compromise action.' `
+                        -Evidence ([ordered]@{
+                            'Most recent update' = $latest.Date
+                            'Source'             = $latest.Source
+                            'Days ago'           = [int]$age
+                        })
+        }
+    }
 
     $wuService = Get-Service -Name wuauserv -ErrorAction SilentlyContinue
     if ($wuService) {
@@ -2140,6 +2207,9 @@ function Test-ListeningPorts {
         $imagePath = if ($process) { $process.Path } else { $null }
         $signature = Get-SignatureInfo -Path $imagePath
 
+        $leaf = if ($imagePath) { try { Split-Path $imagePath -Leaf } catch { '' } } else { '' }
+        $isLolBin = [bool]($leaf -and $script:LolBinNames -contains $leaf.ToLowerInvariant())
+
         $isWildcard = ("$($listener.LocalAddress)" -eq '0.0.0.0' -or "$($listener.LocalAddress)" -eq '::')
         $isLoopback = ("$($listener.LocalAddress)" -eq '127.0.0.1' -or "$($listener.LocalAddress)" -eq '::1')
 
@@ -2167,10 +2237,12 @@ function Test-ListeningPorts {
             $null = $severities.Add('Medium')
         }
 
-        # A wildcard bind on a high port by a non-Microsoft binary is the
-        # classic shape of a backdoor or an unintentionally exposed service.
-        if ($isWildcard -and -not $signature.IsMicrosoft -and $expectedSystemPorts -notcontains [int]$listener.LocalPort) {
-            $null = $reasons.Add("Accepts connections from any network interface on port $($listener.LocalPort)")
+        # A wildcard bind on a high port is the classic shape of a backdoor or
+        # an unintentionally exposed service. Signed Microsoft binaries are
+        # normally excluded as noise, but known execution-proxy LOLBins are
+        # Microsoft-signed by definition and must not get a free pass here.
+        if ($isWildcard -and (-not $signature.IsMicrosoft -or $isLolBin) -and $expectedSystemPorts -notcontains [int]$listener.LocalPort) {
+            $null = $reasons.Add("Accepts connections from any network interface on port $($listener.LocalPort)$(if ($isLolBin) { " - held by $leaf, a signed Windows utility commonly abused to proxy network activity" })")
             $null = $severities.Add('Medium')
         }
 
@@ -2214,11 +2286,20 @@ function Test-OutboundConnections {
         if (-not $imagePath) { continue }
 
         $signature = Get-SignatureInfo -Path $imagePath
-        if ($signature.IsMicrosoft) { continue }
+        $leaf = try { Split-Path $imagePath -Leaf } catch { '' }
+        $isLolBin = [bool]($leaf -and $script:LolBinNames -contains $leaf.ToLowerInvariant())
+
+        # Microsoft-signed binaries are normally excluded as noise, but the
+        # LOLBin list is Microsoft-signed by definition - a C2 channel proxied
+        # through mshta/rundll32/certutil/etc. must not be waved through here.
+        if ($signature.IsMicrosoft -and -not $isLolBin) { continue }
 
         $reasons = @(Test-SuspiciousPath -Path $imagePath)
-        if (-not $signature.IsSigned)       { $reasons += 'The connecting process is unsigned' }
-        elseif (-not $signature.IsTrusted)  { $reasons += "The connecting process has an invalid signature ($($signature.Status))" }
+        if (-not $signature.IsMicrosoft) {
+            if (-not $signature.IsSigned)       { $reasons += 'The connecting process is unsigned' }
+            elseif (-not $signature.IsTrusted)  { $reasons += "The connecting process has an invalid signature ($($signature.Status))" }
+        }
+        if ($isLolBin) { $reasons += "The connection is held by $leaf, a signed Windows utility frequently abused as a network proxy for malware (living-off-the-land)" }
         if ($reasons.Count -eq 0) { continue }
 
         # One finding per binary, not per socket.
@@ -2231,9 +2312,12 @@ function Test-OutboundConnections {
                    ForEach-Object { "$($_.RemoteAddress):$($_.RemotePort)" } |
                    Select-Object -Unique -First 12)
 
-        Add-Finding -Category $script:NetworkCategory -Check 'OutboundConnections' -Severity 'High' `
-                    -Title "Unsigned process '$($process.Name)' has active internet connections" `
-                    -Detail (($reasons -join '; ') + '. An unsigned binary holding open outbound sessions is the normal shape of command-and-control or data exfiltration traffic.') `
+        $severity = if ($signature.IsMicrosoft) { 'Medium' } else { 'High' }
+        $titlePrefix = if ($signature.IsMicrosoft) { 'Signed LOLBin' } else { 'Unsigned process' }
+
+        Add-Finding -Category $script:NetworkCategory -Check 'OutboundConnections' -Severity $severity `
+                    -Title "$titlePrefix '$($process.Name)' has active internet connections" `
+                    -Detail (($reasons -join '; ') + '. ' + $(if ($signature.IsMicrosoft) { 'A genuine Windows utility holding open outbound sessions can be entirely legitimate network activity, or it can be malware proxying its traffic through a trusted binary to avoid exactly this kind of check.' } else { 'An unsigned binary holding open outbound sessions is the normal shape of command-and-control or data exfiltration traffic.' })) `
                     -Recommendation 'Identify the program. If you cannot attribute it to software you installed, kill the process, block it in the firewall, and submit the file to VirusTotal before deleting.' `
                     -Evidence ([ordered]@{
                         'Process'    = "$($process.Name) (PID $($process.Id))"
@@ -2476,17 +2560,33 @@ function Test-RootCertificates {
             $subject = "$($certificate.Subject)"
             $issuer  = "$($certificate.Issuer)"
 
+            $selfSigned = ($subject -eq $issuer)
+
+            # The Subject field is free text the certificate's own author
+            # chose, so a rogue self-signed root can simply name itself
+            # "Microsoft Corporation" or "DigiCert Trusted Root" and defeat a
+            # bare substring match. A name match only counts as a real pass
+            # when the certificate isn't a freshly-minted self-signed one -
+            # genuine bundled Windows/major-CA roots are long established,
+            # not something appearing with a recent issue date.
             $recognised = $false
             foreach ($known in $expectedIssuers) {
                 if ($subject -like "*$known*") { $recognised = $true; break }
             }
-            if ($recognised) { continue }
+            $recentlyIssued = ($certificate.NotBefore -gt (Get-Date).AddYears(-2))
+            $nameLikelySpoofed = ($recognised -and $selfSigned -and $recentlyIssued)
+            if ($recognised -and -not $nameLikelySpoofed) { continue }
 
-            $reasons    = New-Object System.Collections.ArrayList
-            $severity   = $storeSpec.BaseSeverity
-            $selfSigned = ($subject -eq $issuer)
+            $reasons  = New-Object System.Collections.ArrayList
+            $severity = $storeSpec.BaseSeverity
 
-            if ($selfSigned) { $null = $reasons.Add('The certificate is self-signed, so nobody vouched for it but itself') }
+            if ($nameLikelySpoofed) {
+                $severity = 'Critical'
+                $null = $reasons.Add("The subject name matches a known CA ('$(Get-CommonName $subject)'), but this certificate is self-signed and was issued recently - genuine Windows/major-CA roots are long-established and are never distributed this way, so a trusted-sounding name here is a red flag rather than a pass")
+            }
+            elseif ($selfSigned) {
+                $null = $reasons.Add('The certificate is self-signed, so nobody vouched for it but itself')
+            }
 
             # Interception proxies name themselves; this catches the honest ones.
             if ($subject -match 'Fiddler|Charles|Burp|mitmproxy|BrowserStack|Zscaler|Netskope|Forcepoint|Blue ?Coat|Cisco Umbrella|Kaspersky Anti-Virus Personal Root|AVG|Avast|ESET SSL Filter|BitDefender Personal|DO_NOT_TRUST') {
@@ -3480,7 +3580,7 @@ $style
 
 <div class="verdict $verdictClass">
   $verdict
-  <span>$(ConvertTo-HtmlText (Get-SeverityGuidance ($(if ($counts.Critical) { 'Critical' } elseif ($counts.High) { 'High' } elseif ($counts.Medium) { 'Medium' } else { 'Info' }))))</span>
+  <span>$(ConvertTo-HtmlText (Get-SeverityGuidance ($(if ($counts.Critical) { 'Critical' } elseif ($counts.High) { 'High' } elseif ($counts.Medium) { 'Medium' } elseif ($counts.Low) { 'Low' } else { 'Info' }))))</span>
 </div>
 
 $tiles

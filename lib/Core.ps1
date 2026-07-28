@@ -310,6 +310,35 @@ function Expand-PathVariables {
     return $expanded.Trim()
 }
 
+function Get-ReferencedScriptContent {
+    <#
+        .SYNOPSIS
+        Reads the content of a script file a command line points at.
+
+        A Run key or Scheduled Task entry that reads
+        "powershell.exe -File C:\ProgramData\Vendor\task.ps1" looks completely
+        clean by command-line pattern matching alone - the badness, if any, is
+        inside task.ps1, which nothing was reading before. This is capped at
+        400 lines so one huge referenced file can't stall a scan.
+    #>
+    param([string]$CommandLine)
+
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) { return $null }
+
+    foreach ($match in [regex]::Matches($CommandLine, '(?i)(?<path>"[^"]+\.(ps1|vbs|js|jse|bat|cmd|wsf|hta)"|\S+\.(ps1|vbs|js|jse|bat|cmd|wsf|hta)\b)')) {
+        $candidate = $match.Groups['path'].Value.Trim('"')
+        $expanded  = Expand-PathVariables -Path $candidate
+        if (-not (Test-Path -LiteralPath $expanded -PathType Leaf -ErrorAction SilentlyContinue)) { continue }
+
+        try {
+            $content = (Get-Content -LiteralPath $expanded -TotalCount 400 -ErrorAction Stop) -join "`n"
+            if ($content) { return [pscustomobject]@{ Path = $expanded; Content = $content } }
+        }
+        catch { }
+    }
+    return $null
+}
+
 function Resolve-ExecutablePath {
     <#
         .SYNOPSIS
@@ -465,14 +494,14 @@ function Test-SuspiciousPath {
     if ($leaf -match "[\u202A-\u202E\u2066-\u2069]") {
         $null = $reasons.Add('Filename contains a bidirectional text override character')
     }
-    if ($leaf -match '\.(doc|docx|pdf|jpg|png|txt|xls|xlsx|mp4|zip)\s*\.(exe|scr|com|pif|bat|cmd|js|vbs)$') {
+    if ($leaf -match '\.(doc|docx|pdf|jpg|png|txt|xls|xlsx|mp4|zip)\s*\.(exe|scr|com|pif|bat|cmd|js|jse|vbs|vbe|wsf|hta|msi|scf|url|lnk)$') {
         $null = $reasons.Add('Filename uses a double extension')
     }
     if ($leaf -match '\s+\.(exe|scr|com|dll)$') {
         $null = $reasons.Add('Filename pads the extension with whitespace')
     }
     # System binary names living outside the system directory.
-    if ($leaf -match '^(svchost|lsass|csrss|services|winlogon|explorer|smss|spoolsv|taskhost|dwm|conhost)\.exe$' -and
+    if ($leaf -match '^(svchost|lsass|csrss|services|winlogon|explorer|smss|spoolsv|taskhost|taskhostw|dwm|conhost|wininit|lsm|sihost|ctfmon|dllhost|runtimebroker|searchindexer|fontdrvhost)\.exe$' -and
         $Path -notmatch '\\Windows\\(System32|SysWOW64|WinSxS)\\') {
         $null = $reasons.Add('Masquerades as a Windows system binary but sits outside System32')
     }

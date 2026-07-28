@@ -419,21 +419,21 @@ function Test-SystemHardening {
     $secureDesk   = Get-RegistryValue -Path $systemPolicy -Name 'PromptOnSecureDesktop'
     $tokenFilter  = Get-RegistryValue -Path $systemPolicy -Name 'LocalAccountTokenFilterPolicy'
 
-    if ([int]$enableLua -eq 0) {
+    if ($null -ne $enableLua -and [int]$enableLua -eq 0) {
         Add-Finding -Category $script:DefenderCategory -Check 'Hardening' -Severity 'Critical' `
                     -Title 'User Account Control is completely disabled' `
                     -Detail 'EnableLUA = 0 means every process started by an administrator runs fully elevated with no prompt. It also disables the sandboxing that protects Edge and other applications.' `
                     -Recommendation 'Set EnableLUA to 1 and reboot.' `
                     -Evidence ([ordered]@{ 'EnableLUA' = $enableLua })
     }
-    elseif ([int]$consent -eq 0) {
+    elseif ($null -ne $consent -and [int]$consent -eq 0) {
         Add-Finding -Category $script:DefenderCategory -Check 'Hardening' -Severity 'High' `
                     -Title 'UAC elevates administrators without prompting' `
                     -Detail 'ConsentPromptBehaviorAdmin = 0 ("Elevate without prompting") lets any process silently gain full administrator rights.' `
                     -Recommendation 'Set ConsentPromptBehaviorAdmin to 2 (always prompt on the secure desktop).' `
                     -Evidence ([ordered]@{ 'ConsentPromptBehaviorAdmin' = $consent })
     }
-    elseif ([int]$consent -eq 5 -and [int]$secureDesk -eq 0) {
+    elseif ($null -ne $consent -and [int]$consent -eq 5 -and $null -ne $secureDesk -and [int]$secureDesk -eq 0) {
         Add-Finding -Category $script:DefenderCategory -Check 'Hardening' -Severity 'Medium' `
                     -Title 'UAC prompts are not shown on the secure desktop' `
                     -Detail 'With PromptOnSecureDesktop = 0 the consent dialog can be manipulated by other software running in your session.' `
@@ -588,29 +588,48 @@ function Test-SystemHardening {
 function Test-PatchLevel {
     Write-ScanLog -Message 'Patch level' -Level 'Step'
 
-    try {
-        $latest = Get-HotFix -ErrorAction Stop |
-                  Where-Object { $_.InstalledOn } |
-                  Sort-Object InstalledOn -Descending |
-                  Select-Object -First 1
+    # Get-HotFix only reflects the classic QFE mechanism and routinely misses
+    # the cumulative updates that carry most of the actual security fixes on
+    # Windows 10/11, which can make a fully patched machine look stale. Cross
+    # -check against Windows Update's own last-success timestamp and trust
+    # whichever source is more recent.
+    $candidates = New-Object System.Collections.ArrayList
 
-        if ($latest) {
-            $age = ((Get-Date) - $latest.InstalledOn).TotalDays
-            if ($age -gt 60) {
-                $severity = if ($age -gt 120) { 'High' } else { 'Medium' }
-                Add-Finding -Category $script:DefenderCategory -Check 'PatchLevel' -Severity $severity `
-                            -Title "No Windows update installed in $([int]$age) days" `
-                            -Detail 'Unpatched machines are exploited through vulnerabilities that no antivirus product will catch, because the exploit runs inside a trusted process.' `
-                            -Recommendation 'Run Windows Update. If updates are failing or the service is disabled, resolve that first - blocked updates are a common post-compromise action.' `
-                            -Evidence ([ordered]@{
-                                'Most recent hotfix' = $latest.HotFixID
-                                'Installed on'       = $latest.InstalledOn
-                                'Days ago'           = [int]$age
-                            })
-            }
+    try {
+        $latestHotfix = Get-HotFix -ErrorAction Stop |
+                        Where-Object { $_.InstalledOn } |
+                        Sort-Object InstalledOn -Descending |
+                        Select-Object -First 1
+        if ($latestHotfix) {
+            $null = $candidates.Add([pscustomobject]@{ Date = $latestHotfix.InstalledOn; Source = "Hotfix $($latestHotfix.HotFixID)" })
         }
     }
     catch { }
+
+    $lastSuccess = Get-RegistryValue -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\Results\Install' -Name 'LastSuccessTime'
+    if ($lastSuccess) {
+        $parsed = [datetime]::MinValue
+        if ([datetime]::TryParse("$lastSuccess", [ref]$parsed)) {
+            $null = $candidates.Add([pscustomobject]@{ Date = $parsed; Source = 'Windows Update history' })
+        }
+    }
+
+    if ($candidates.Count -gt 0) {
+        $latest = $candidates | Sort-Object Date -Descending | Select-Object -First 1
+        $age = ((Get-Date) - $latest.Date).TotalDays
+        if ($age -gt 60) {
+            $severity = if ($age -gt 120) { 'High' } else { 'Medium' }
+            Add-Finding -Category $script:DefenderCategory -Check 'PatchLevel' -Severity $severity `
+                        -Title "No Windows update installed in $([int]$age) days" `
+                        -Detail 'Unpatched machines are exploited through vulnerabilities that no antivirus product will catch, because the exploit runs inside a trusted process.' `
+                        -Recommendation 'Run Windows Update. If updates are failing or the service is disabled, resolve that first - blocked updates are a common post-compromise action.' `
+                        -Evidence ([ordered]@{
+                            'Most recent update' = $latest.Date
+                            'Source'             = $latest.Source
+                            'Days ago'           = [int]$age
+                        })
+        }
+    }
 
     $wuService = Get-Service -Name wuauserv -ErrorAction SilentlyContinue
     if ($wuService) {
