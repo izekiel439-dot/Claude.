@@ -1,0 +1,57 @@
+name: tests
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: engine (ubuntu, pwsh 7)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse
+        shell: pwsh
+        run: |
+          $errors = $null; $tokens = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path ./ArgusDriveScanner.ps1).Path, [ref]$tokens, [ref]$errors)
+          if ($errors) {
+              $errors | ForEach-Object { Write-Host "line $($_.Extent.StartLineNumber): $($_.Message)" }
+              exit 1
+          }
+          Write-Host "parsed clean, $($tokens.Count) tokens"
+
+      - name: Engine tests
+        shell: pwsh
+        run: ./tests/Engine.Tests.ps1
+
+  windows:
+    name: engine + gui (windows)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Engine tests (pwsh 7)
+        shell: pwsh
+        run: ./tests/Engine.Tests.ps1
+
+      # The GUI half only exists here. Windows Forms needs a single-threaded
+      # apartment; pwsh defaults to MTA, so -STA is not optional.
+      - name: GUI tests (pwsh 7, STA)
+        run: pwsh -NoProfile -STA -File ./tests/Gui.Tests.ps1
+
+      # Windows PowerShell 5.1 is what the script actually ships against - it is
+      # the one already present on Windows 10/11, and what Scan-Drive.cmd invokes.
+      # It is STA by default.
+      - name: Engine tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: ./tests/Engine.Tests.ps1
+
+      - name: GUI tests (Windows PowerShell 5.1, STA)
+        run: powershell.exe -NoProfile -STA -File ./tests/Gui.Tests.ps1

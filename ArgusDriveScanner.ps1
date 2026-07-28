@@ -1726,9 +1726,13 @@ $openButton.Add_Click({
     }
 })
 
-$form.Add_FormClosing({
-    param($eventSender, $e)
-
+function Resolve-CloseRequest {
+    <#
+        Decides what a close request should do, and returns $true if the close
+        has to be held back. Kept out of the event handler so the decision can
+        be tested without a window - the handler itself is then thin enough to
+        read at a glance.
+    #>
     if ($script:Scanning) {
         # The scan owns this thread and is several frames below us on the stack.
         # Disposing the form now would leave the checks writing to dead controls,
@@ -1736,12 +1740,17 @@ $form.Add_FormClosing({
         # window when it unwinds.
         $script:Sync.Cancel  = $true
         $script:ClosePending = $true
-        $statusLabel.Text    = 'Stopping...'
-        $e.Cancel = $true
-        return
+        return $true
     }
 
     if ($script:Sync) { $script:Sync.Cancel = $true }
+    return $false
+}
+
+$form.Add_FormClosing({
+    param($eventSender, $e)
+    $e.Cancel = Resolve-CloseRequest
+    if ($e.Cancel) { $statusLabel.Text = 'Stopping...' }
 })
 
 Update-DriveList
