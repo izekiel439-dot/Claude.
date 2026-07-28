@@ -94,6 +94,14 @@ Assert 'nothing critical in this tree' (@($script:Findings | Where-Object { $_.S
 $script:PumpUi = $realPump
 
 Start-TestGroup '[4] selecting a row fills the detail box'
+# Windows Forms raises SelectedIndexChanged from the native control, so a
+# ListView that has never had a window handle stays silent no matter what is
+# assigned to Selected - and this form is deliberately never shown. Reading
+# .Handle forces the handle into existence without making anything visible,
+# which is what lets the real handler run. In the app the window is shown and
+# the handle already exists, so this is a cost of testing headless, not
+# something the scanner needs.
+$null = $resultList.Handle
 $resultList.Items[0].Selected = $true
 Assert 'detail box populated' ($detailBox.Text.Length -gt 0) "len=$($detailBox.Text.Length)"
 
