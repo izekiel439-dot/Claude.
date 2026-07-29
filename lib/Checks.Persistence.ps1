@@ -49,7 +49,7 @@ function Add-AutorunFinding {
 
     foreach ($reason in $pathFlags) {
         $null = $reasons.Add($reason)
-        $null = $severities.Add('High')
+        $null = $severities.Add((Get-PathFlagSeverity -Reason $reason -Signature $signature))
     }
     foreach ($hit in $cmdFlags) {
         $null = $reasons.Add($hit.Reason)
@@ -86,11 +86,14 @@ function Add-AutorunFinding {
 
     $severity = Get-WorstSeverity -Severities @($severities) -Default $BaselineSeverity
 
-    # A trusted Microsoft binary in a normal location is background noise even
-    # when it trips a soft heuristic - but not when the binary itself is a
-    # known execution-proxy tool, or the script it was told to run is bad;
-    # neither of those signals may be silently dropped.
-    if ($signature.IsMicrosoft -and $pathFlags.Count -eq 0 -and $cmdFlags.Count -eq 0 -and $scriptContentFlags.Count -eq 0 -and -not $isLolBin) { $severity = 'Info' }
+    # A trusted Microsoft binary tripping only soft location heuristics is
+    # background noise: OneDrive lives in %LocalAppData% by Microsoft's own
+    # design. Drop it to Info - but never when the binary is a known execution
+    # proxy, when the command or referenced script is bad, or when the location
+    # flag is itself a strong filename deception (a masquerading system-binary
+    # name is worth High even signed). None of those signals may be dropped.
+    $hasStrongPathFlag = @($pathFlags | Where-Object { $script:StrongPathReasons -contains $_ }).Count -gt 0
+    if ($signature.IsMicrosoft -and -not $hasStrongPathFlag -and $cmdFlags.Count -eq 0 -and $scriptContentFlags.Count -eq 0 -and -not $isLolBin) { $severity = 'Info' }
 
     $evidence = [ordered]@{
         'Location'    = $Source
@@ -554,6 +557,19 @@ function Test-ComHijacks {
                 if ([string]::IsNullOrWhiteSpace("$default")) { continue }
 
                 $shadowsMachine = Test-Path -LiteralPath "HKLM:\SOFTWARE\Classes\CLSID\$($clsid.PSChildName)\$serverType"
+
+                # A per-user COM server that only points at a genuine system
+                # component (shell32.dll and the like) is how plenty of installed
+                # applications register themselves; it is not a hijack unless it
+                # overrides a machine-wide CLSID. When it does not shadow HKLM,
+                # skip it - this removes the bulk of the noise and one signature
+                # check per entry. A real hijack points at attacker-controlled
+                # code outside the system directories and still falls through.
+                if (-not $shadowsMachine) {
+                    $resolvedServer = Resolve-ExecutablePath -CommandLine ([string]$default)
+                    if ($resolvedServer -match '\\Windows\\(System32|SysWOW64|WinSxS)\\') { continue }
+                }
+
                 $severity = if ($shadowsMachine) { 'Critical' } else { 'High' }
                 $detail = if ($shadowsMachine) {
                     "This per-user CLSID registration overrides a machine-wide one. Any process running as this user that instantiates $($clsid.PSChildName) will load the user-controlled file instead of the system component."

@@ -1,4 +1,4 @@
-﻿# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # GENERATED FILE - built from Invoke-PCScan.ps1 + lib/ by build/Build-Standalone.ps1
 # Edit the sources in the repository, not this file, then rebuild.
 # ---------------------------------------------------------------------------
@@ -136,11 +136,12 @@ if (-not $isWindows_) {
 # State
 # --------------------------------------------------------------------------
 
-$script:Findings        = New-Object System.Collections.ArrayList
-$script:SignatureCache  = @{}
-$script:AclCache        = @{}
-$script:CheckErrors     = New-Object System.Collections.ArrayList
-$script:ChecksRun       = New-Object System.Collections.ArrayList
+$script:Findings          = New-Object System.Collections.ArrayList
+$script:SignatureCache    = @{}
+$script:AclCache          = @{}
+$script:PathCommandCache  = @{}
+$script:CheckErrors       = New-Object System.Collections.ArrayList
+$script:ChecksRun         = New-Object System.Collections.ArrayList
 
 $script:SeverityRank = @{
     'Critical' = 0
@@ -168,6 +169,21 @@ $script:SuspiciousPathPatterns = @(
     @{ Pattern = '\\Windows\\SysWOW64\\Tasks\\';     Reason = 'Executable staged in the task definition folder' }
     @{ Pattern = '\\PerfLogs\\';                     Reason = 'Runs from PerfLogs' }
     @{ Pattern = '\\Windows\\addins\\';              Reason = 'Runs from the addins directory' }
+)
+
+# Filename-level deception signals from Test-SuspiciousPath. These are strong on
+# their own and stay High regardless of who signed the file: legitimate signed
+# software never carries a bidi override, a double extension, or a system-binary
+# name outside System32. Location-only flags (the patterns above) are different -
+# a great deal of legitimate modern software installs under the user profile, so
+# those are graded against the signature by Get-PathFlagSeverity. Keep these
+# strings byte-identical with the ones Test-SuspiciousPath emits (it references
+# this list) so the two never drift apart.
+$script:StrongPathReasons = @(
+    'Filename contains a bidirectional text override character'
+    'Filename uses a double extension'
+    'Filename pads the extension with whitespace'
+    'Masquerades as a Windows system binary but sits outside System32'
 )
 
 # Signed Microsoft tools attackers use as proxies to run their own code.
@@ -394,6 +410,12 @@ function Get-UserHivePaths {
 
     $null = $result.Add([pscustomobject]@{ Sid = 'Current'; User = "$env:USERNAME"; Root = 'HKCU:' })
 
+    # HKCU is a link onto HKU\<current-user-SID>, so enumerating that SID again
+    # below would process and report every per-user autorun twice. Record the
+    # current SID and skip it in the HKU walk; 'Current' above already covers it.
+    $currentSid = $null
+    try { $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value } catch { }
+
     if (-not (Get-PSDrive -Name HKU -ErrorAction SilentlyContinue)) {
         $null = New-PSDrive -Name HKU -PSProvider Registry -Root HKEY_USERS -Scope Script -ErrorAction SilentlyContinue
     }
@@ -403,6 +425,8 @@ function Get-UserHivePaths {
         $sid = Split-Path $hive.Name -Leaf
         # Skip machine/service SIDs and the _Classes shadow hives.
         if ($sid -notmatch '^S-1-5-21-[\d-]+$') { continue }
+        # Already walked as HKCU above - don't double-count the current user.
+        if ($currentSid -and $sid -eq $currentSid) { continue }
         $name = $sid
         try {
             $account = (New-Object Security.Principal.SecurityIdentifier($sid)).Translate([Security.Principal.NTAccount]).Value
@@ -458,6 +482,41 @@ function Get-ReferencedScriptContent {
         catch { }
     }
     return $null
+}
+
+function Resolve-CommandOnPath {
+    <#
+        .SYNOPSIS
+        Finds an executable by bare name on PATH, the fast way.
+
+        Get-Command resolves this correctly but costs on the order of a second
+        per call because the first use spins up the whole command-discovery and
+        module-autoload subsystem; a scan hits this for every autorun that names
+        a bare command rather than a full path. A direct PATH + PATHEXT probe
+        returns the same on-disk image in about a millisecond. Cached per name.
+    #>
+    param([string]$Name)
+
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $null }
+    $key = $Name.ToLowerInvariant()
+    if ($script:PathCommandCache.ContainsKey($key)) { return $script:PathCommandCache[$key] }
+
+    # Probe with the raw .NET filesystem API, not Test-Path: a bare name that is
+    # NOT on PATH otherwise fans out to (PATH dirs x PATHEXT) provider round-trips
+    # and each Test-Path costs milliseconds, so a single miss could run for
+    # seconds. [IO.File]::Exists is a direct syscall, microseconds per probe.
+    $result = $null
+    $extensions = if ([System.IO.Path]::HasExtension($Name)) { @('') } else { @($env:PATHEXT -split ';' | Where-Object { $_ }) }
+    foreach ($dir in ($env:PATH -split ';')) {
+        if ([string]::IsNullOrWhiteSpace($dir)) { continue }
+        foreach ($ext in $extensions) {
+            try { $probe = [System.IO.Path]::Combine($dir, $Name + $ext) } catch { continue }
+            if ([System.IO.File]::Exists($probe)) { $result = $probe; break }
+        }
+        if ($result) { break }
+    }
+    $script:PathCommandCache[$key] = $result
+    return $result
 }
 
 function Resolve-ExecutablePath {
@@ -516,10 +575,8 @@ function Resolve-ExecutablePath {
     }
 
     if ($candidate -notmatch '[\\/]') {
-        $resolved = Get-Command $candidate -ErrorAction SilentlyContinue |
-                    Where-Object { $_.Path } |
-                    Select-Object -First 1
-        if ($resolved) { $candidate = $resolved.Path }
+        $resolved = Resolve-CommandOnPath -Name $candidate
+        if ($resolved) { $candidate = $resolved }
     }
 
     return $candidate
@@ -556,16 +613,6 @@ function Get-SignatureInfo {
     }
     catch { $status = 'Unreadable' }
 
-    try {
-        $info = (Get-Item -LiteralPath $Path -ErrorAction Stop).VersionInfo
-        if ($info) {
-            $company   = "$($info.CompanyName)".Trim()
-            $product   = "$($info.ProductName)".Trim()
-            $versionOk = -not [string]::IsNullOrWhiteSpace($company)
-        }
-    }
-    catch { }
-
     # An exclusion list here is a trap: any SignatureStatus value the author
     # didn't think of (e.g. 'UnknownError', returned for a file that isn't a
     # valid PE at all - garbage bytes with an .exe extension) falls through
@@ -578,6 +625,26 @@ function Get-SignatureInfo {
     # trivially forged in an unsigned file's resources.
     $isMicrosoft = $false
     if ($isTrusted -and $signer -match 'O=Microsoft Corporation|CN=Microsoft (Windows|Corporation)') { $isMicrosoft = $true }
+
+    # The version resource is only read to attribute a publisher the signature
+    # doesn't already establish. For a trusted Microsoft binary the signer is
+    # authoritative, so skip the ~100ms version-info load - that saving lands on
+    # the large volume of signed system files a scan walks. Product and
+    # VersionInfoOk are not consumed by any check, so leaving them unset is fine.
+    if ($isMicrosoft) {
+        $company = 'Microsoft Corporation'; $versionOk = $true
+    }
+    else {
+        try {
+            $info = (Get-Item -LiteralPath $Path -ErrorAction Stop).VersionInfo
+            if ($info) {
+                $company   = "$($info.CompanyName)".Trim()
+                $product   = "$($info.ProductName)".Trim()
+                $versionOk = -not [string]::IsNullOrWhiteSpace($company)
+            }
+        }
+        catch { }
+    }
 
     $result = [pscustomobject]@{
         Path = $Path; Exists = $true; Status = $status; Signer = (Get-CommonName $signer)
@@ -617,19 +684,22 @@ function Test-SuspiciousPath {
     $leaf = try { Split-Path $Path -Leaf } catch { $Path }
 
     # Right-to-left override and friends: used to disguise "xxxexe.doc" as a document.
+    # The four reason strings below are the "strong" filename-deception signals;
+    # they are sourced from $script:StrongPathReasons so Get-PathFlagSeverity can
+    # recognise them by exact text and always grade them High.
     if ($leaf -match "[\u202A-\u202E\u2066-\u2069]") {
-        $null = $reasons.Add('Filename contains a bidirectional text override character')
+        $null = $reasons.Add($script:StrongPathReasons[0])
     }
     if ($leaf -match '\.(doc|docx|pdf|jpg|png|txt|xls|xlsx|mp4|zip)\s*\.(exe|scr|com|pif|bat|cmd|js|jse|vbs|vbe|wsf|hta|msi|scf|url|lnk)$') {
-        $null = $reasons.Add('Filename uses a double extension')
+        $null = $reasons.Add($script:StrongPathReasons[1])
     }
     if ($leaf -match '\s+\.(exe|scr|com|dll)$') {
-        $null = $reasons.Add('Filename pads the extension with whitespace')
+        $null = $reasons.Add($script:StrongPathReasons[2])
     }
     # System binary names living outside the system directory.
     if ($leaf -match '^(svchost|lsass|csrss|services|winlogon|explorer|smss|spoolsv|taskhost|taskhostw|dwm|conhost|wininit|lsm|sihost|ctfmon|dllhost|runtimebroker|searchindexer|fontdrvhost)\.exe$' -and
         $Path -notmatch '\\Windows\\(System32|SysWOW64|WinSxS)\\') {
-        $null = $reasons.Add('Masquerades as a Windows system binary but sits outside System32')
+        $null = $reasons.Add($script:StrongPathReasons[3])
     }
 
     return @($reasons)
@@ -651,6 +721,34 @@ function Test-SuspiciousCommand {
         }
     }
     return @($hits)
+}
+
+function Get-PathFlagSeverity {
+    <#
+        .SYNOPSIS
+        Severity for a single suspicious-path flag, weighed against the file's
+        signature.
+
+        A filename-level deception (bidi override, double extension, whitespace
+        padding, system-binary masquerade) is a strong signal in its own right
+        and stays High no matter who signed the file. A location-only flag
+        ("runs from AppData") is how a large amount of legitimate modern software
+        ships - OneDrive, Spotify, Teams, Slack, Discord and VS Code all install
+        per-user under the profile - so a valid Authenticode signature from a
+        real publisher pulls a location flag down out of the High band. The
+        finding is still recorded, just not screaming: Microsoft-signed is Info,
+        any other trusted publisher is Low, and unsigned or invalidly-signed
+        stays High, which is exactly the profile of a payload dropped in a
+        user-writable directory.
+    #>
+    param([string]$Reason, [object]$Signature)
+
+    if ($script:StrongPathReasons -contains $Reason) { return 'High' }
+    if ($Signature -and $Signature.Exists) {
+        if ($Signature.IsMicrosoft) { return 'Info' }
+        if ($Signature.IsTrusted)   { return 'Low' }
+    }
+    return 'High'
 }
 
 function Get-WorstSeverity {
@@ -797,7 +895,7 @@ function Add-AutorunFinding {
 
     foreach ($reason in $pathFlags) {
         $null = $reasons.Add($reason)
-        $null = $severities.Add('High')
+        $null = $severities.Add((Get-PathFlagSeverity -Reason $reason -Signature $signature))
     }
     foreach ($hit in $cmdFlags) {
         $null = $reasons.Add($hit.Reason)
@@ -834,11 +932,14 @@ function Add-AutorunFinding {
 
     $severity = Get-WorstSeverity -Severities @($severities) -Default $BaselineSeverity
 
-    # A trusted Microsoft binary in a normal location is background noise even
-    # when it trips a soft heuristic - but not when the binary itself is a
-    # known execution-proxy tool, or the script it was told to run is bad;
-    # neither of those signals may be silently dropped.
-    if ($signature.IsMicrosoft -and $pathFlags.Count -eq 0 -and $cmdFlags.Count -eq 0 -and $scriptContentFlags.Count -eq 0 -and -not $isLolBin) { $severity = 'Info' }
+    # A trusted Microsoft binary tripping only soft location heuristics is
+    # background noise: OneDrive lives in %LocalAppData% by Microsoft's own
+    # design. Drop it to Info - but never when the binary is a known execution
+    # proxy, when the command or referenced script is bad, or when the location
+    # flag is itself a strong filename deception (a masquerading system-binary
+    # name is worth High even signed). None of those signals may be dropped.
+    $hasStrongPathFlag = @($pathFlags | Where-Object { $script:StrongPathReasons -contains $_ }).Count -gt 0
+    if ($signature.IsMicrosoft -and -not $hasStrongPathFlag -and $cmdFlags.Count -eq 0 -and $scriptContentFlags.Count -eq 0 -and -not $isLolBin) { $severity = 'Info' }
 
     $evidence = [ordered]@{
         'Location'    = $Source
@@ -1302,6 +1403,19 @@ function Test-ComHijacks {
                 if ([string]::IsNullOrWhiteSpace("$default")) { continue }
 
                 $shadowsMachine = Test-Path -LiteralPath "HKLM:\SOFTWARE\Classes\CLSID\$($clsid.PSChildName)\$serverType"
+
+                # A per-user COM server that only points at a genuine system
+                # component (shell32.dll and the like) is how plenty of installed
+                # applications register themselves; it is not a hijack unless it
+                # overrides a machine-wide CLSID. When it does not shadow HKLM,
+                # skip it - this removes the bulk of the noise and one signature
+                # check per entry. A real hijack points at attacker-controlled
+                # code outside the system directories and still falls through.
+                if (-not $shadowsMachine) {
+                    $resolvedServer = Resolve-ExecutablePath -CommandLine ([string]$default)
+                    if ($resolvedServer -match '\\Windows\\(System32|SysWOW64|WinSxS)\\') { continue }
+                }
+
                 $severity = if ($shadowsMachine) { 'Critical' } else { 'High' }
                 $detail = if ($shadowsMachine) {
                     "This per-user CLSID registration overrides a machine-wide one. Any process running as this user that instantiates $($clsid.PSChildName) will load the user-controlled file instead of the system component."
@@ -2223,7 +2337,7 @@ function Test-ListeningPorts {
 
         foreach ($reason in (Test-SuspiciousPath -Path $imagePath)) {
             $null = $reasons.Add($reason)
-            $null = $severities.Add('High')
+            $null = $severities.Add((Get-PathFlagSeverity -Reason $reason -Signature $signature))
         }
 
         if ($imagePath -and $signature.Exists -and -not $signature.IsMicrosoft) {
@@ -2298,6 +2412,13 @@ function Test-OutboundConnections {
         # LOLBin list is Microsoft-signed by definition - a C2 channel proxied
         # through mshta/rundll32/certutil/etc. must not be waved through here.
         if ($signature.IsMicrosoft -and -not $isLolBin) { continue }
+
+        # A binary validly signed by a trusted, identifiable publisher holding
+        # open outbound sessions is ordinary background traffic wherever it lives
+        # - Spotify installs under %AppData% and phones home constantly. Only an
+        # unsigned or invalidly-signed process, or a LOLBin proxy, is worth a flag
+        # here; a stolen-certificate case still surfaces under the signature check.
+        if (-not $signature.IsMicrosoft -and $signature.IsSigned -and $signature.IsTrusted -and -not $isLolBin) { continue }
 
         $reasons = @(Test-SuspiciousPath -Path $imagePath)
         if (-not $signature.IsMicrosoft) {
@@ -3721,48 +3842,62 @@ if (-not $Quiet) {
 }
 
 $runAll = ($Categories -contains 'All')
+$scanCompleted = $false
 
-if ($runAll -or $Categories -contains 'Persistence') { Invoke-PersistenceChecks }
-if ($runAll -or $Categories -contains 'Defender')    { Invoke-DefenderChecks }
-if ($runAll -or $Categories -contains 'Network')     { Invoke-NetworkChecks }
-if ($runAll -or $Categories -contains 'Accounts')    { Invoke-AccountChecks }
+try {
+    if ($runAll -or $Categories -contains 'Persistence') { Invoke-PersistenceChecks }
+    if ($runAll -or $Categories -contains 'Defender')    { Invoke-DefenderChecks }
+    if ($runAll -or $Categories -contains 'Network')     { Invoke-NetworkChecks }
+    if ($runAll -or $Categories -contains 'Accounts')    { Invoke-AccountChecks }
+    $scanCompleted = $true
+}
+finally {
+    # This block runs on normal completion AND when the user presses Ctrl+C, so
+    # cancelling a long scan still prints the summary and writes a report of
+    # everything found up to the moment it was stopped, instead of losing it all.
+    $finishedAt = Get-Date
+    $findings   = @($script:Findings)
 
-$finishedAt = Get-Date
-$findings   = @($script:Findings)
-
-Write-ConsoleSummary -Findings $findings -HostInfo $hostInfo -Errors @($script:CheckErrors)
-
-# --------------------------------------------------------------------------
-# Report
-# --------------------------------------------------------------------------
-
-if (-not $NoReport) {
-    if (-not $OutputPath) {
-        $desktop = [Environment]::GetFolderPath('Desktop')
-        if ([string]::IsNullOrWhiteSpace($desktop)) { $desktop = $env:USERPROFILE }
-        $OutputPath = Join-Path $desktop ("ArgusScan-{0}.html" -f $startedAt.ToString('yyyyMMdd-HHmmss'))
+    if (-not $scanCompleted) {
+        Write-Host ''
+        Write-Host '  Scan cancelled - showing what Argus found before it stopped.' -ForegroundColor Yellow
     }
-    if ([System.IO.Path]::GetExtension($OutputPath) -ne '.html') { $OutputPath = "$OutputPath.html" }
 
-    $htmlPath = New-HtmlReport -Findings $findings -HostInfo $hostInfo -OutputPath $OutputPath `
-                               -StartedAt $startedAt -FinishedAt $finishedAt `
-                               -Errors @($script:CheckErrors) -ChecksRun @($script:ChecksRun)
+    Write-ConsoleSummary -Findings $findings -HostInfo $hostInfo -Errors @($script:CheckErrors)
 
-    Write-Host ''
-    Write-Host "  Report: $htmlPath" -ForegroundColor Green
+    # ----------------------------------------------------------------------
+    # Report
+    # ----------------------------------------------------------------------
+    if (-not $NoReport) {
+        if (-not $OutputPath) {
+            $desktop = [Environment]::GetFolderPath('Desktop')
+            if ([string]::IsNullOrWhiteSpace($desktop)) { $desktop = $env:USERPROFILE }
+            $OutputPath = Join-Path $desktop ("ArgusScan-{0}.html" -f $startedAt.ToString('yyyyMMdd-HHmmss'))
+        }
+        if ([System.IO.Path]::GetExtension($OutputPath) -ne '.html') { $OutputPath = "$OutputPath.html" }
 
-    if ($Json) {
-        $jsonPath = [System.IO.Path]::ChangeExtension($OutputPath, '.json')
-        $null = New-JsonReport -Findings $findings -HostInfo $hostInfo -OutputPath $jsonPath `
-                               -StartedAt $startedAt -FinishedAt $finishedAt `
-                               -Errors @($script:CheckErrors) -ChecksRun @($script:ChecksRun)
-        Write-Host "  JSON:   $jsonPath" -ForegroundColor Green
+        $htmlPath = New-HtmlReport -Findings $findings -HostInfo $hostInfo -OutputPath $OutputPath `
+                                   -StartedAt $startedAt -FinishedAt $finishedAt `
+                                   -Errors @($script:CheckErrors) -ChecksRun @($script:ChecksRun)
+
+        Write-Host ''
+        if (-not $scanCompleted) { Write-Host '  Partial report (scan was cancelled before finishing):' -ForegroundColor Yellow }
+        Write-Host "  Report: $htmlPath" -ForegroundColor Green
+
+        if ($Json) {
+            $jsonPath = [System.IO.Path]::ChangeExtension($OutputPath, '.json')
+            $null = New-JsonReport -Findings $findings -HostInfo $hostInfo -OutputPath $jsonPath `
+                                   -StartedAt $startedAt -FinishedAt $finishedAt `
+                                   -Errors @($script:CheckErrors) -ChecksRun @($script:ChecksRun)
+            Write-Host "  JSON:   $jsonPath" -ForegroundColor Green
+        }
+        Write-Host ''
     }
-    Write-Host ''
 }
 
 # Exit code reflects the worst finding, so the script is usable from a
 # scheduled task or a CI-style wrapper: 0 clean, 1 low/medium, 2 high, 3 critical.
+# (A cancelled run terminates in the finally above and never reaches this.)
 $exitCode = 0
 if     (@($findings | Where-Object { $_.Severity -eq 'Critical' }).Count -gt 0) { $exitCode = 3 }
 elseif (@($findings | Where-Object { $_.Severity -eq 'High' }).Count -gt 0)     { $exitCode = 2 }

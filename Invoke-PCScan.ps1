@@ -144,48 +144,62 @@ if (-not $Quiet) {
 }
 
 $runAll = ($Categories -contains 'All')
+$scanCompleted = $false
 
-if ($runAll -or $Categories -contains 'Persistence') { Invoke-PersistenceChecks }
-if ($runAll -or $Categories -contains 'Defender')    { Invoke-DefenderChecks }
-if ($runAll -or $Categories -contains 'Network')     { Invoke-NetworkChecks }
-if ($runAll -or $Categories -contains 'Accounts')    { Invoke-AccountChecks }
+try {
+    if ($runAll -or $Categories -contains 'Persistence') { Invoke-PersistenceChecks }
+    if ($runAll -or $Categories -contains 'Defender')    { Invoke-DefenderChecks }
+    if ($runAll -or $Categories -contains 'Network')     { Invoke-NetworkChecks }
+    if ($runAll -or $Categories -contains 'Accounts')    { Invoke-AccountChecks }
+    $scanCompleted = $true
+}
+finally {
+    # This block runs on normal completion AND when the user presses Ctrl+C, so
+    # cancelling a long scan still prints the summary and writes a report of
+    # everything found up to the moment it was stopped, instead of losing it all.
+    $finishedAt = Get-Date
+    $findings   = @($script:Findings)
 
-$finishedAt = Get-Date
-$findings   = @($script:Findings)
-
-Write-ConsoleSummary -Findings $findings -HostInfo $hostInfo -Errors @($script:CheckErrors)
-
-# --------------------------------------------------------------------------
-# Report
-# --------------------------------------------------------------------------
-
-if (-not $NoReport) {
-    if (-not $OutputPath) {
-        $desktop = [Environment]::GetFolderPath('Desktop')
-        if ([string]::IsNullOrWhiteSpace($desktop)) { $desktop = $env:USERPROFILE }
-        $OutputPath = Join-Path $desktop ("ArgusScan-{0}.html" -f $startedAt.ToString('yyyyMMdd-HHmmss'))
+    if (-not $scanCompleted) {
+        Write-Host ''
+        Write-Host '  Scan cancelled - showing what Argus found before it stopped.' -ForegroundColor Yellow
     }
-    if ([System.IO.Path]::GetExtension($OutputPath) -ne '.html') { $OutputPath = "$OutputPath.html" }
 
-    $htmlPath = New-HtmlReport -Findings $findings -HostInfo $hostInfo -OutputPath $OutputPath `
-                               -StartedAt $startedAt -FinishedAt $finishedAt `
-                               -Errors @($script:CheckErrors) -ChecksRun @($script:ChecksRun)
+    Write-ConsoleSummary -Findings $findings -HostInfo $hostInfo -Errors @($script:CheckErrors)
 
-    Write-Host ''
-    Write-Host "  Report: $htmlPath" -ForegroundColor Green
+    # ----------------------------------------------------------------------
+    # Report
+    # ----------------------------------------------------------------------
+    if (-not $NoReport) {
+        if (-not $OutputPath) {
+            $desktop = [Environment]::GetFolderPath('Desktop')
+            if ([string]::IsNullOrWhiteSpace($desktop)) { $desktop = $env:USERPROFILE }
+            $OutputPath = Join-Path $desktop ("ArgusScan-{0}.html" -f $startedAt.ToString('yyyyMMdd-HHmmss'))
+        }
+        if ([System.IO.Path]::GetExtension($OutputPath) -ne '.html') { $OutputPath = "$OutputPath.html" }
 
-    if ($Json) {
-        $jsonPath = [System.IO.Path]::ChangeExtension($OutputPath, '.json')
-        $null = New-JsonReport -Findings $findings -HostInfo $hostInfo -OutputPath $jsonPath `
-                               -StartedAt $startedAt -FinishedAt $finishedAt `
-                               -Errors @($script:CheckErrors) -ChecksRun @($script:ChecksRun)
-        Write-Host "  JSON:   $jsonPath" -ForegroundColor Green
+        $htmlPath = New-HtmlReport -Findings $findings -HostInfo $hostInfo -OutputPath $OutputPath `
+                                   -StartedAt $startedAt -FinishedAt $finishedAt `
+                                   -Errors @($script:CheckErrors) -ChecksRun @($script:ChecksRun)
+
+        Write-Host ''
+        if (-not $scanCompleted) { Write-Host '  Partial report (scan was cancelled before finishing):' -ForegroundColor Yellow }
+        Write-Host "  Report: $htmlPath" -ForegroundColor Green
+
+        if ($Json) {
+            $jsonPath = [System.IO.Path]::ChangeExtension($OutputPath, '.json')
+            $null = New-JsonReport -Findings $findings -HostInfo $hostInfo -OutputPath $jsonPath `
+                                   -StartedAt $startedAt -FinishedAt $finishedAt `
+                                   -Errors @($script:CheckErrors) -ChecksRun @($script:ChecksRun)
+            Write-Host "  JSON:   $jsonPath" -ForegroundColor Green
+        }
+        Write-Host ''
     }
-    Write-Host ''
 }
 
 # Exit code reflects the worst finding, so the script is usable from a
 # scheduled task or a CI-style wrapper: 0 clean, 1 low/medium, 2 high, 3 critical.
+# (A cancelled run terminates in the finally above and never reaches this.)
 $exitCode = 0
 if     (@($findings | Where-Object { $_.Severity -eq 'Critical' }).Count -gt 0) { $exitCode = 3 }
 elseif (@($findings | Where-Object { $_.Severity -eq 'High' }).Count -gt 0)     { $exitCode = 2 }

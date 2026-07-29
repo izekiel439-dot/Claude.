@@ -36,7 +36,7 @@ function Test-ListeningPorts {
 
         foreach ($reason in (Test-SuspiciousPath -Path $imagePath)) {
             $null = $reasons.Add($reason)
-            $null = $severities.Add('High')
+            $null = $severities.Add((Get-PathFlagSeverity -Reason $reason -Signature $signature))
         }
 
         if ($imagePath -and $signature.Exists -and -not $signature.IsMicrosoft) {
@@ -111,6 +111,13 @@ function Test-OutboundConnections {
         # LOLBin list is Microsoft-signed by definition - a C2 channel proxied
         # through mshta/rundll32/certutil/etc. must not be waved through here.
         if ($signature.IsMicrosoft -and -not $isLolBin) { continue }
+
+        # A binary validly signed by a trusted, identifiable publisher holding
+        # open outbound sessions is ordinary background traffic wherever it lives
+        # - Spotify installs under %AppData% and phones home constantly. Only an
+        # unsigned or invalidly-signed process, or a LOLBin proxy, is worth a flag
+        # here; a stolen-certificate case still surfaces under the signature check.
+        if (-not $signature.IsMicrosoft -and $signature.IsSigned -and $signature.IsTrusted -and -not $isLolBin) { continue }
 
         $reasons = @(Test-SuspiciousPath -Path $imagePath)
         if (-not $signature.IsMicrosoft) {
