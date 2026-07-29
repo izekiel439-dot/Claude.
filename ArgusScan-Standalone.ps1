@@ -547,7 +547,14 @@ function Resolve-ExecutablePath {
             $parts = $line.Split(' ')
             for ($i = $parts.Count; $i -ge 1; $i--) {
                 $probe = ($parts[0..($i - 1)] -join ' ').Trim()
-                if ($probe -match '\.(exe|dll|sys|scr|com|bat|cmd|ps1|vbs|js|jar|msi)$' -or (Test-Path -LiteralPath $probe -PathType Leaf -ErrorAction SilentlyContinue)) {
+                # Test-Path throws a terminating IOException (not suppressed by
+                # SilentlyContinue) on malformed input - e.g. a path containing
+                # '|' or other invalid characters, which untrusted registry/
+                # service command lines routinely do. Guard it so one bad entry
+                # cannot abort resolution.
+                $probeExists = $false
+                try { $probeExists = Test-Path -LiteralPath $probe -PathType Leaf -ErrorAction SilentlyContinue } catch { $probeExists = $false }
+                if ($probe -match '\.(exe|dll|sys|scr|com|bat|cmd|ps1|vbs|js|jar|msi)$' -or $probeExists) {
                     $candidate = $probe
                     break
                 }
@@ -563,7 +570,10 @@ function Resolve-ExecutablePath {
     $candidate = $candidate.Trim('"', ' ', "`t")
 
     # rundll32 / regsvr32 point at a DLL that matters more than the host binary.
-    $leaf = try { Split-Path $candidate -Leaf } catch { $candidate }
+    # Split-Path emits a non-terminating provider error on a syntactically
+    # invalid path, which -ErrorAction Stop promotes to catchable; the fallback
+    # takes the trailing segment so a malformed candidate still yields a leaf.
+    $leaf = try { Split-Path $candidate -Leaf -ErrorAction Stop } catch { ($candidate -split '[\\/]')[-1] }
     if ($leaf -match '^(rundll32|regsvr32)(\.exe)?$') {
         $remainder = $line.Substring([Math]::Min($line.Length, $line.IndexOf($leaf) + $leaf.Length)).Trim()
         $remainder = ($remainder -replace '^(/[a-zA-Z]\s+)+', '').Trim().Trim('"')
@@ -681,7 +691,7 @@ function Test-SuspiciousPath {
         if ($Path -match $rule.Pattern) { $null = $reasons.Add($rule.Reason) }
     }
 
-    $leaf = try { Split-Path $Path -Leaf } catch { $Path }
+    $leaf = try { Split-Path $Path -Leaf -ErrorAction Stop } catch { ($Path -split '[\\/]')[-1] }
 
     # Right-to-left override and friends: used to disguise "xxxexe.doc" as a document.
     # The four reason strings below are the "strong" filename-deception signals;
